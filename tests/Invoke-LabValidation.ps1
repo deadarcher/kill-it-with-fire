@@ -15,6 +15,7 @@
       notepadpp  L3 on an app whose uninstaller is gone; restore round trip; the app runs again
       hooks      one synthetic app hooked in a dozen ways (IFEO, AppInit, Userinit, Active Setup, verbs, file
                  types, shortcut, task, Run, firewall, service): all found, removed, restored exactly
+      restorestop  a restore that can't undo one change stops there; a rerun finishes once the cause is gone
       plan       the window's path: -Plan <file> -Exclude ...; plan guards (other computer, stale plan)
       policy     HKLM\SOFTWARE\Policies\Leftovers locks enforced by the engine (and shown by the window)
       refusal    the RFF agent, a Microsoft MSI by ProductCode, a security vendor, a Windows keyword
@@ -34,7 +35,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('putty', 'profile', 'notepadpp', 'hooks', 'plan', 'policy', 'refusal', 'bitness', 'pending', 'resume', 'filter', 'credprov')]
+    [ValidateSet('putty', 'profile', 'notepadpp', 'hooks', 'restorestop', 'plan', 'policy', 'refusal', 'bitness', 'pending', 'resume', 'filter', 'credprov')]
     [string] $Scenario,
     [string] $Phase = 'run',
     [string] $Engine,
@@ -70,7 +71,12 @@ function Invoke-Engine {
     param([string[]] $Arguments, [string] $Exe = $HostExe)
     $out = Join-Path $StateDir ('engine-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.txt')
     $argLine = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Engine) + $Arguments
-    $quoted = @($argLine | ForEach-Object { if ($_ -match '[\s"]' -or $_ -eq '') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } })
+    # CommandLineToArgvW rules: backslashes doubled before a quote (a trailing '\' ate the closing quote).
+    $quoted = @($argLine | ForEach-Object {
+            if ($_ -and $_ -notmatch '[\s"]') { $_ } else {
+                $s = [regex]::Replace($_, '(\\*)"', { param($m) ($m.Groups[1].Value * 2) + '\"' })
+                '"' + [regex]::Replace($s, '(\\+)$', { param($m) $m.Groups[1].Value * 2 }) + '"'
+            } })
     $p = Start-Process -FilePath $Exe -ArgumentList $quoted -PassThru -Wait -NoNewWindow -RedirectStandardOutput $out
     $text = if (Test-Path -LiteralPath $out) { Get-Content -LiteralPath $out -Raw } else { '' }
     Remove-Item -LiteralPath $out -Force -ErrorAction SilentlyContinue
@@ -248,6 +254,14 @@ function Get-Uninstall {
         }
     }
     return $null
+}
+
+function Get-PendingRenames {
+    # The boot-time move list, or none: once the last entry is gone Windows removes the value itself.
+    $k = Open-RegKey 'HKLM64' 'SYSTEM\CurrentControlSet\Control\Session Manager'
+    try { $v = $k.GetValue('PendingFileRenameOperations', $null) } finally { $k.Close() }
+    if ($null -eq $v) { return @() }
+    return @($v)
 }
 
 function Save-State { param([string] $Name, $Value) ($Value | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath (Join-Path $StateDir "$Name.json") -Encoding UTF8 }
@@ -601,6 +615,17 @@ switch ($Scenario) {
             $run2 = Get-NewestRun $started
             $r = Invoke-Engine @('-Restore', $run2.runId, '-Force', '-Quiet')
             Check 'sole Userinit entry: restore puts the app''s entry back' ($r.Code -eq 0 -and (Get-ItemProperty -LiteralPath $wl).Userinit -eq "$exe,")
+
+            # The app replaced userinit.exe AND another product hooked in after it: Windows' entry goes
+            # back in front, the other product's entry stays (review 2026-09-26).
+            $other = 'C:\Program Files\OtherVendor\agent.exe'
+            Set-ItemProperty -Path $wl -Name Userinit -Value "$exe,$other,"
+            $r = Invoke-Engine @('-Name', $name, '-Level', '3', '-Include', 'LogonHooks', '-SkipUninstall', '-Force', '-Quiet')
+            $ui = (Get-ItemProperty -LiteralPath $wl).Userinit
+            Check 'Userinit: Windows'' entry back in front, the other product''s entry kept' ($r.Code -eq 0 -and $ui -eq "$env:SystemRoot\system32\userinit.exe,$other,") $ui
+            $run3 = Get-NewestRun $started
+            $r = Invoke-Engine @('-Restore', $run3.runId, '-Force', '-Quiet')
+            Check 'Userinit: restore puts the exact old value back' ($r.Code -eq 0 -and (Get-ItemProperty -LiteralPath $wl).Userinit -eq "$exe,$other,")
         } finally {
             # Leave the machine as it was, whatever happened above.
             Set-ItemProperty -Path $wl -Name Userinit -Value $userinitBefore
@@ -617,6 +642,31 @@ switch ($Scenario) {
             & sc.exe delete LeftoversLabHooksSvc 2>&1 | Out-Null
             Remove-TestApp 'LeftoversHooksTest' $folder
         }
+    }
+
+    'restorestop' {
+        # A restore that can't undo one change must STOP there (older changes may depend on it), and a
+        # rerun, once the cause is gone, must finish the job.
+        $name = 'Leftovers Restore Test'
+        $folder = 'C:\Program Files\LeftoversRestoreTest'
+        New-TestApp 'LeftoversRestoreTest' $name $folder @('a.txt', 'b.txt')
+        try {
+            $r = Invoke-Engine @('-Name', $name, '-Level', '3', '-Force', '-Quiet')
+            Check 'L3 exit 0' ($r.Code -eq 0) "exit $($r.Code)"
+            $run = Get-NewestRun $started
+            Check 'L3: folder and entry gone' (-not (Test-Path $folder) -and -not (Get-Uninstall $name))
+            # Something new appears where the folder was: the restore must not overwrite it.
+            New-Item -ItemType Directory -Force -Path $folder | Out-Null
+            Set-Content -LiteralPath (Join-Path $folder 'new.txt') -Value 'someone else' -Encoding ASCII
+            $r = Invoke-Engine @('-Restore', $run.runId, '-Force', '-Quiet')
+            Check 'restore with a blocker: exit 1' ($r.Code -eq 1) "exit $($r.Code)"
+            Check 'restore stopped at the blocked folder: nothing older (the entry) was put back' (-not (Get-Uninstall $name))
+            Check 'the blocker was not overwritten' ((Get-Content -LiteralPath (Join-Path $folder 'new.txt')) -eq 'someone else')
+            [System.IO.Directory]::Delete($folder, $true)
+            $r = Invoke-Engine @('-Restore', $run.runId, '-Force', '-Quiet')
+            Check 'rerun after the cause is gone: exit 0' ($r.Code -eq 0) "exit $($r.Code)"
+            Check 'rerun: folder and entry back' ((Test-Path (Join-Path $folder 'a.txt')) -and [bool](Get-Uninstall $name))
+        } finally { Remove-TestApp 'LeftoversRestoreTest' $folder }
     }
 
     'policy' {
@@ -733,16 +783,18 @@ switch ($Scenario) {
             Check 'the run is marked pending-reboot' ($run.status -eq 'pending-reboot') $run.status
             Check 'the other file moved now' (-not (Test-Path (Join-Path $folder 'a.txt')))
             Check 'the locked file is still in place' (Test-Path $locked)
-            $pfro = @((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations)
+            $pfro = Get-PendingRenames
             Check 'the locked file is scheduled to move at boot' (@($pfro | Where-Object { $_ -like "*$locked" }).Count -eq 1)
             Save-State 'resume' @{ runId = $run.runId; holder = $holder.Id }
             if ($Scenario -eq 'pending') {
                 Stop-Process -Id $holder.Id -Force -ErrorAction SilentlyContinue
                 $r = Invoke-Engine @('-Restore', $run.runId, '-Force', '-Quiet')
                 Check 'restore before the reboot: exit 0' ($r.Code -eq 0) "exit $($r.Code)"
-                $pfro = @((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations)
+                $pfro = Get-PendingRenames
                 Check 'restore took the boot-time move back out' (@($pfro | Where-Object { $_ -like "*$locked" }).Count -eq 0)
                 Check 'restore: both files and the entry are back' ((Test-Path $locked) -and (Test-Path (Join-Path $folder 'a.txt')) -and [bool](Get-Uninstall $name))
+                $r = Invoke-Engine @('-Resume', $run.runId, '-Quiet')
+                Check 'a restored run refuses -Resume (no reboot loop)' ($r.Code -eq 2) "exit $($r.Code)"
                 Remove-TestApp 'LeftoversLockedTest' $folder
             }
         } elseif ($Phase -eq 'after') {

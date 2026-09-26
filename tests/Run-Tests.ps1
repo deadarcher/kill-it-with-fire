@@ -168,6 +168,16 @@ Assert-Equal 'C:\Program Files\App\uninstall.exe|/S' ($sp -join '|') 'split an u
 Assert-Equal ".\Leftovers.ps1 -ProductCode '{DDC95F26-92B1-4546-9678-5DC68DF76BA0}' -Level 3 -Exclude Drivers,Files -IncludeReview -Log '\\srv\logs\' -Force" `
     (Format-CommandLine -AppName 'x' -ProductCode '{DDC95F26-92B1-4546-9678-5DC68DF76BA0}' -Level 3 -Exclude @('Drivers', 'Files') -IncludeUserData $false -IncludeReview $true -NoBackup $false -NoLog $false -LogPath '\\srv\logs\') 'command line for the window'
 Assert-Equal ".\Leftovers.ps1 -Name 'Bob''s App' -Level 0" (Format-CommandLine -AppName "Bob's App" -Level 0 -IncludeUserData $false -IncludeReview $false -NoBackup $false -NoLog $false) 'scan command, quote escaped, no -Force'
+Assert-Equal '"C:\IT Logs\\"' (ConvertTo-ArgvString 'C:\IT Logs\') 'argv: a trailing backslash is doubled before the closing quote'
+Assert-Equal '"a\"b"' (ConvertTo-ArgvString 'a"b') 'argv: an embedded quote is escaped'
+Assert-Equal '"x\\\"y z"' (ConvertTo-ArgvString 'x\"y z') 'argv: backslashes before an embedded quote are doubled'
+Assert-Equal 'plain' (ConvertTo-ArgvString 'plain') 'argv: nothing to quote'
+Assert-Equal '""' (ConvertTo-ArgvString '') 'argv: empty argument'
+Assert-Equal 'C:\a\b' (ConvertTo-ArgvString 'C:\a\b') 'argv: backslashes alone are left alone'
+$anc = Get-ProcessAncestry
+Assert-Equal $true ($anc.Contains($PID)) 'ancestry: this process'
+Assert-Equal $true ($anc.Count -ge 2) 'ancestry: and its parent'
+Assert-Equal $true ((Split-Path (Get-PowerShellExe) -Leaf) -in @('powershell.exe', 'pwsh.exe') -and (Test-Path (Get-PowerShellExe))) 'child host is a real PowerShell console exe'
 $al = ConvertTo-ArgumentList ([ordered]@{ Name = 'Notepad++ (64-bit x64)'; Level = 3; Exclude = @('Drivers', 'Files'); Force = [System.Management.Automation.SwitchParameter]::new($true); Quiet = [System.Management.Automation.SwitchParameter]::new($false) })
 Assert-Equal '-Name|Notepad++ (64-bit x64)|-Level|3|-Exclude|Drivers,Files|-Force' ($al -join '|') 'relaunch arguments'
 Assert-Equal $null (Get-Prop ([pscustomobject]@{ a = 1 }) 'b') 'missing property is null, not a strict-mode error'

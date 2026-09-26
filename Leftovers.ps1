@@ -737,6 +737,38 @@ function Remove-ListEntry {
     return $out
 }
 
+function ConvertTo-ArgvString {
+    # One argument for a Windows command line (CommandLineToArgvW rules): quoted when it needs it, with
+    # backslashes doubled wherever they come right before a quote. "C:\IT Logs\" otherwise ate its own
+    # closing quote and every argument after it (review 2026-09-26).
+    param([AllowEmptyString()] [string] $Arg)
+    if ($Arg -and $Arg -notmatch '[\s"]') { return $Arg }
+    $s = [regex]::Replace($Arg, '(\\*)"', { param($m) ($m.Groups[1].Value * 2) + '\"' })
+    $s = [regex]::Replace($s, '(\\+)$', { param($m) $m.Groups[1].Value * 2 })
+    return '"' + $s + '"'
+}
+
+function Get-PowerShellExe {
+    # The PowerShell that runs this script, as a console exe: never the ISE or another host, which would
+    # open the script instead of running it (review 2026-09-26).
+    if ($PSVersionTable.PSEdition -eq 'Core') { return (Join-Path $PSHOME 'pwsh.exe') }
+    return (Join-Path $PSHOME 'powershell.exe')
+}
+
+function Invoke-SelfRelaunch {
+    # Run this script again in another PowerShell (64-bit, or STA) with the same arguments, in this console,
+    # and hand back its exit code. Built with ConvertTo-ArgvString, not PowerShell's own native-argument
+    # passing, which mangles embedded quotes and trailing backslashes on 5.1.
+    param([string] $Exe, [string[]] $HostArgs, [string[]] $ScriptArgs)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $Exe
+    $psi.Arguments = (@($HostArgs + @('-File', $script:ScriptPath) + $ScriptArgs) | ForEach-Object { ConvertTo-ArgvString $_ }) -join ' '
+    $psi.UseShellExecute = $false
+    $p = [System.Diagnostics.Process]::Start($psi)
+    $p.WaitForExit()
+    return $p.ExitCode
+}
+
 function ConvertTo-ArgumentList {
     # Bound parameters back to an argument array (the 64-bit / STA relaunch, and the window's command line).
     param([System.Collections.IDictionary] $Bound)
@@ -1155,6 +1187,18 @@ function Get-KeyAppReference {
     return $null
 }
 
+function Get-ProcessAncestry {
+    # This process and every process above it. Never "the app's running program", even when it runs
+    # from the app's folder: Git Bash cleaning up Git would otherwise stop the operator's own shell
+    # (review 2026-09-26). Returned with a comma: assign it, don't wrap it in @().
+    $ids = New-Object 'System.Collections.Generic.HashSet[int]'
+    $parent = @{}
+    try { foreach ($p in @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId -ErrorAction Stop)) { $parent[[int]$p.ProcessId] = [int]$p.ParentProcessId } } catch { }
+    $cur = $PID
+    for ($n = 0; $n -lt 64 -and $cur -gt 0 -and $ids.Add($cur); $n++) { if (-not $parent.ContainsKey($cur)) { break }; $cur = $parent[$cur] }
+    return , $ids
+}
+
 function Test-PlannedTarget {
     # Already in the plan (a profile item must not duplicate what identity or the keyword found).
     param([string] $Target)
@@ -1173,11 +1217,13 @@ function Add-Kept {
 }
 
 function New-RegOp {
-    param([string] $Kind, [string] $Hive, [string] $Path, [string] $ValueName, [string] $Entry, [string] $Separator, [switch] $DeleteKeyIfEmpty, [switch] $Optional, [hashtable] $Expect, [string] $SetKind, [object] $SetData)
+    param([string] $Kind, [string] $Hive, [string] $Path, [string] $ValueName, [string] $Entry, [string] $Separator, [switch] $DeleteKeyIfEmpty, [switch] $Optional, [hashtable] $Expect, [string] $SetKind, [object] $SetData,
+        [string] $Floor, [string] $FloorMatch)
     $op = [ordered]@{ kind = $Kind; hive = $Hive; path = $Path }
     if ($PSBoundParameters.ContainsKey('ValueName')) { $op.name = $ValueName }
     if ($Entry) { $op.entry = $Entry }
     if ($Separator) { $op.separator = $Separator }
+    if ($Floor) { $op.floor = $Floor; $op.floorMatch = $FloorMatch }
     if ($DeleteKeyIfEmpty) { $op.deleteKeyIfEmpty = $true }
     if ($Optional) { $op.optional = $true }
     if ($Expect) { $op.expect = $Expect }
@@ -1675,8 +1721,10 @@ function New-LeftoversPlan {
     # Tied by image path only (its folder, or one of its own MSI files). Its services are left to the
     # service items, which stop them properly.
     $svcImages = @($ourServices | ForEach-Object { $_.Svc.Image } | Where-Object { $_ })
+    $ancestors = Get-ProcessAncestry
     $procGroups = @{}
     foreach ($p in @(Get-Process -ErrorAction SilentlyContinue)) {
+        if ($ancestors.Contains($p.Id)) { continue }
         $pp = $null
         try { $pp = $p.Path } catch { }
         if (-not $pp -or ($svcImages -contains $pp) -or -not (Test-OurReference $pp)) { continue }
@@ -1684,8 +1732,10 @@ function New-LeftoversPlan {
         $procGroups[$pp]++
     }
     foreach ($pp in $procGroups.Keys) {
+        $inWin = Test-PathUnder $pp $env:SystemRoot
         [void](Add-PlanItem -Category 'RunningProcess' -Level 3 -Target "program $pp" -Action "stop it ($($procGroups[$pp]) running now); unsaved work in it is lost, and a restore does not restart it" `
-                -Evidence "runs from the app's own folder or files" -Risk 'high' -Op ([ordered]@{ kind = 'ProcessStop'; path = $pp }))
+                -Evidence "runs from the app's own folder or files" -Risk 'high' -Review:$inWin -Note $(if ($inWin) { 'needs review: a program under C:\Windows that one MSI claims' } else { $null }) `
+                -Op ([ordered]@{ kind = 'ProcessStop'; path = $pp }))
     }
 
     # ---------------------------------------------------------------- device filters
@@ -2104,10 +2154,10 @@ function New-LeftoversPlan {
     # ---------------------------------------------------------------- Winlogon, LSA, network providers, print monitors, AppInit, IFEO, Winsock
     $wl = Open-Key 'HKLM64' 'SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
     $wlPath = 'SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
-    # Windows' own value is the floor: an empty Userinit (or one without userinit.exe) means no shell at
+    # Windows' own entry is the floor: an empty Userinit (or one without userinit.exe) means no shell at
     # sign-in, and Windows only falls back to its default when the value is ABSENT, not when it is empty
-    # (review 2026-09-26). So when the app's entries are all that is there, the value goes back to the
-    # default instead of being emptied.
+    # (review 2026-09-26). The floor is applied by the op itself when it runs (a plan can be a day old),
+    # and it puts Windows' entry back IN FRONT of whatever other products left there, never over them.
     $wlDefaults = @{ Shell = 'explorer.exe'; Userinit = "$env:SystemRoot\system32\userinit.exe," }
     foreach ($v in @('Shell', 'Userinit')) {
         $data = [string](Get-ValueSafe $wl $v)
@@ -2117,14 +2167,11 @@ function New-LeftoversPlan {
         $after = $data
         foreach ($entry in $ours) { $after = Remove-ListEntry $after $entry ',' }
         $needs = if ($v -eq 'Userinit') { '(?i)(^|[\\,])userinit\.exe' } else { '\S' }
-        if ($after -notmatch $needs) {
-            [void](Add-PlanItem -Category 'Winlogon' -Level 3 -Target "HKLM\$wlPath : $v" -Action "set $v back to Windows' default '$($wlDefaults[$v])' (the app's entries were all that was left)" `
-                    -Evidence "$v = $data" -Risk 'critical' -Op (New-RegOp -Kind 'RegSetValue' -Hive 'HKLM64' -Path $wlPath -ValueName $v -SetKind 'String' -SetData $wlDefaults[$v]))
-            continue
-        }
+        $floorNeeded = ($after -notmatch $needs)
         foreach ($entry in $ours) {
-            [void](Add-PlanItem -Category 'Winlogon' -Level 3 -Target "HKLM\$wlPath : $v" -Action "remove '$entry' from $v, keep every other entry" -Evidence "$v = $data" -Risk 'critical' `
-                    -Op (New-RegOp -Kind 'RegRemoveListEntry' -Hive 'HKLM64' -Path $wlPath -ValueName $v -Entry $entry -Separator ','))
+            $act = if ($floorNeeded) { "remove '$entry' from $v; Windows' default '$($wlDefaults[$v])' goes back in (nothing left in it would start the $(if ($v -eq 'Shell') { 'desktop' } else { 'sign-in' }))" } else { "remove '$entry' from $v, keep every other entry" }
+            [void](Add-PlanItem -Category 'Winlogon' -Level 3 -Target "HKLM\$wlPath : $v" -Action $act -Evidence "$v = $data" -Risk 'critical' `
+                    -Op (New-RegOp -Kind 'RegRemoveListEntry' -Hive 'HKLM64' -Path $wlPath -ValueName $v -Entry $entry -Separator ',' -Floor $wlDefaults[$v] -FloorMatch $needs))
         }
     }
     Close-Key $wl
@@ -2441,10 +2488,20 @@ function New-LeftoversPlan {
     $coveredValues = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($i in $script:Items) {
         $ops = @($i.op | Where-Object { $_ })
-        if ($ops.Count -ne 1) { continue }
-        $kind = [string](Get-Prop $ops[0] 'kind')
-        if ($kind -eq 'RegDeleteKey') { [void]$coveredKeys.Add([string]$i.target) }
-        elseif ($kind -eq 'RegDeleteValue') { [void]$coveredValues.Add([string]$i.target) }
+        if ($ops.Count -eq 1) {
+            # One op: the item's target already IS its real location.
+            $kind = [string](Get-Prop $ops[0] 'kind')
+            if ($kind -eq 'RegDeleteKey') { [void]$coveredKeys.Add([string]$i.target) }
+            elseif ($kind -eq 'RegDeleteValue') { [void]$coveredValues.Add([string]$i.target) }
+            continue
+        }
+        # Several ops (a Run value and its StartupApproved twin): each one by its own real location.
+        foreach ($o in $ops) {
+            $kind = [string](Get-Prop $o 'kind'); $oh = [string](Get-Prop $o 'hive'); $opath = [string](Get-Prop $o 'path')
+            if (-not $oh -or -not $opath) { continue }
+            if ($kind -eq 'RegDeleteKey') { [void]$coveredKeys.Add((Format-RegPath $oh $opath)) }
+            elseif ($kind -eq 'RegDeleteValue') { $on = [string](Get-Prop $o 'name'); [void]$coveredValues.Add("$(Format-RegPath $oh $opath) : $(if ($on) { $on } else { '(default)' })") }
+        }
     }
     foreach ($rv in $regExact) {
         $keyNoUser = if ($rv.Hive -eq 'HKU') { $rv.Key.Substring($rv.Key.IndexOf('\') + 1) } else { $rv.Key }
@@ -2935,7 +2992,9 @@ function Move-TreeToQuarantine {
     $sddl = $null
     try { $sddl = (Get-Acl -LiteralPath $Source).Sddl } catch { }
     [void](New-Item -ItemType Directory -Path $dest -Force)
-    if (-not $left.Count) { Remove-Item -LiteralPath $Source -Force -ErrorAction SilentlyContinue }
+    # Directory.Delete(non-recursive), not Remove-Item: if a file lands in it meanwhile, this fails cleanly
+    # instead of prompting (and a "Yes" deleting it with no quarantine copy). Review 2026-09-26.
+    if (-not $left.Count) { try { [System.IO.Directory]::Delete($Source, $false) } catch { } }
     if (-not (Test-Path -LiteralPath $Source)) {
         $Moves.Add([pscustomobject]@{ src = $Source; dst = $dest; state = 'emptied'; sddl = $sddl })
     } elseif ([Leftovers.Native]::DeleteOnReboot($Source)) {
@@ -3045,6 +3104,12 @@ function Invoke-PrimitiveOp {
                 } elseif ($kind -eq 'RegRemoveListEntry') {
                     $new = Remove-ListEntry ([string]$old) ([string]$Op.entry) ([string]$Op.separator)
                     if ($new -eq [string]$old) { $rec.result = 'skipped'; $rec.note = 'entry already gone'; break }
+                    $floor = [string](Get-Prop $Op 'floor'); $floorMatch = [string](Get-Prop $Op 'floorMatch')
+                    if ($floor -and $floorMatch -and $new -notmatch $floorMatch) {
+                        $rest = $new.Trim().Trim(',').Trim()
+                        $new = if ($rest) { $floor.TrimEnd(',') + ',' + $new.Trim().TrimStart(',') } else { $floor }
+                        $rec.note = "Windows' own '$floor' put back in"
+                    }
                     $k.SetValue($Op.name, $new, $oldKind)
                 } else {
                     $k.SetValue($Op.name, $Op.setData, [Microsoft.Win32.RegistryValueKind]::$([string]$Op.setKind))
@@ -3196,7 +3261,8 @@ function Invoke-PrimitiveOp {
         }
         'ProcessStop' {
             # Found again by image path: the PIDs from the scan are long gone by now.
-            $procs = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $ip = $null; try { $ip = $_.Path } catch { }; $ip -and $ip.Equals([string]$Op.path, [StringComparison]::OrdinalIgnoreCase) })
+            $ancestors = Get-ProcessAncestry
+            $procs = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { -not $ancestors.Contains($_.Id) } | Where-Object { $ip = $null; try { $ip = $_.Path } catch { }; $ip -and $ip.Equals([string]$Op.path, [StringComparison]::OrdinalIgnoreCase) })
             if (-not $procs.Count) { $rec.result = 'skipped'; $rec.note = 'not running'; break }
             $stopped = @(); $failedStop = @()
             foreach ($p in $procs) { try { Stop-Process -Id $p.Id -Force -ErrorAction Stop; $stopped += $p.Id } catch { $failedStop += "$($p.Id) ($($_.Exception.Message))" } }
@@ -3474,7 +3540,14 @@ function Invoke-LeftoversRestore {
                         if ($marked) { $reboot = $true; throw "service $name is marked for deletion until the next reboot: reboot, then run -Restore $RunId again" }
                     }
                     if ($r.backup) { Invoke-RegImport $r.backup }
-                    if (Get-Prop $r 'wasRunning') { [void](Invoke-ScExe @('start', $name)) }
+                    # The service manager ignores registry edits until the next boot: set the start type
+                    # through it too (a partial run had already set this service to disabled).
+                    $startWord = switch ([int](Get-Prop $r 'startOriginal')) { 0 { 'boot' } 1 { 'system' } 2 { 'auto' } 4 { 'disabled' } default { 'demand' } }
+                    [void](Invoke-ScExe @('config', $name, 'start=', $startWord))
+                    if (Get-Prop $r 'wasRunning') {
+                        $st = Invoke-ScExe @('start', $name)
+                        if ($st.Code -notin @(0, 1056)) { Write-RunLog "  service $name is back but did not start (sc start: $($st.Code)); start it once whatever it needs is back" }
+                    }
                     if ([int](Get-Prop $r 'startOriginal') -le 1 -and $r.op.isDriver) { $reboot = $true }
                 }
                 'NetcfgUninstall' {
@@ -3511,15 +3584,22 @@ function Invoke-LeftoversRestore {
             Add-JournalRecord @{ itemId = $r.itemId; category = $r.category; kind = "Undo-$($r.kind)"; undoOf = $r.seq; op = $null; result = 'done' }
             Write-RunLog ("  restored [{0}] {1}" -f $r.category, $r.kind)
         } catch {
+            # STOP here. Newest-first IS the dependency order: carrying on would put back older changes
+            # that rest on this one, such as a device filter for a driver that isn't back (every device in
+            # the class dead at the next boot), or a credential provider while the password sign-in is off
+            # again (review 2026-09-26). Undone records are skipped next time, so a rerun resumes here.
             $failed++
             Add-JournalRecord @{ itemId = $r.itemId; category = $r.category; kind = "Undo-$($r.kind)"; undoOf = $r.seq; op = $null; result = 'failed'; note = $_.Exception.Message }
             Write-RunLog ("  FAILED to restore [{0}] {1}: {2}" -f $r.category, $r.kind, $_.Exception.Message)
+            Write-RunLog "  Restore stopped here: nothing older was put back, because it may depend on this. Fix the cause$(if ($reboot) { ' (reboot first)' }), then run -Restore $RunId again."
+            break
         }
     }
     foreach ($s in $restarts | Select-Object -Unique) { try { Restart-Service -Name $s -Force -ErrorAction Stop } catch { } }
     $meta.status = if ($failed) { 'restore-partial' } else { 'restored' }
     ($meta | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $metaFile -Encoding UTF8
-    Write-RunLog "Restore of $RunId $(if ($failed) { "finished with $failed failure(s)" } else { 'complete' })$(if ($reboot) { '; reboot to finish' })."
+    Write-RunLog "Restore of $RunId $(if ($failed) { 'stopped part way' } else { 'complete' })$(if ($reboot) { '; reboot to finish' })."
+    if ($failed -and $reboot) { return 3010 }
     if ($failed) { return 1 }
     if ($reboot) { return 3010 }
     return 0
@@ -3532,16 +3612,40 @@ function Invoke-LeftoversResume {
     $metaFile = Join-Path $root 'run.json'
     if (-not (Test-Path -LiteralPath $metaFile)) { Write-Host "No run $RunId."; return 3 }
     $meta = Get-Content -LiteralPath $metaFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ([string]$meta.status -in @('restored', 'restore-partial')) { Write-Host "Run $RunId was restored (or partly): there is nothing to resume. -ListRuns shows its state."; return 2 }
     $journal = @(Get-JournalRecords (Join-Path $root 'journal.jsonl'))
     $maxSeq = if ($journal.Count) { [int]($journal | Measure-Object -Property seq -Maximum).Maximum } else { 0 }
     $script:Run = [pscustomobject]@{ RunId = $RunId; Root = $root; Backups = (Join-Path $root 'backups'); Journal = (Join-Path $root 'journal.jsonl'); Seq = $maxSeq; Backup = [bool]$meta.backup; LogFile = $(if ($meta.log) { $meta.log } else { $null }) }
-    $still = 0
+    $still = 0; $leftInPlace = 0
     $resumed = @{}
     foreach ($x in @($journal | Where-Object { $_.kind -like 'Resume-*' -and $_.result -eq 'done' })) { $resumed[[string](Get-Prop $x 'resumeOf')] = $true }
+    foreach ($u in @(Get-JournalRecords (Join-Path $root 'restore.jsonl') | Where-Object { $_.result -eq 'done' -and (Get-Prop $_ 'undoOf') })) { $resumed[[string]$u.undoOf] = $true }
+    # "Still waiting" only while Windows still has the change queued for the next boot. Once a boot has
+    # passed and nothing is queued, another reboot can't help: report it as left in place (exit 1)
+    # instead of asking for reboots forever (review 2026-09-26).
+    $queued = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $smk = Open-Key 'HKLM64' 'SYSTEM\CurrentControlSet\Control\Session Manager'
+    $pfro = @(Get-ValueSafe $smk 'PendingFileRenameOperations' | Where-Object { $_ })
+    Close-Key $smk
+    for ($i = 0; $i -lt $pfro.Count; $i += 2) { [void]$queued.Add((ConvertFrom-PendingRenameEntry ([string]$pfro[$i]))) }
+    $bootedSince = $false
+    try { $bootedSince = ($meta.finished -and ((Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToUniversalTime() -gt (ConvertTo-UtcDate $meta.finished))) } catch { }
     foreach ($r in @($journal | Where-Object { $_.result -eq 'pending' -and -not $resumed.ContainsKey([string]$_.seq) })) {
-        $ok = $true
-        foreach ($m in @(Get-Prop $r 'moves') | Where-Object { $_ }) { if ($m.state -in @('pending', 'emptied-pending') -and (Test-Path -LiteralPath $m.src)) { $ok = $false } }
-        if ($r.kind -eq 'ServiceDelete' -and (Invoke-ScExe @('query', [string]$r.op.name)).Code -ne 1060) { $ok = $false }
+        $ok = $true; $lost = @()
+        foreach ($m in @(Get-Prop $r 'moves') | Where-Object { $_ }) {
+            if ($m.state -notin @('pending', 'emptied-pending') -or -not (Test-Path -LiteralPath $m.src)) { continue }
+            $ok = $false
+            if ($bootedSince -and -not $queued.Contains([string]$m.src)) { $lost += [string]$m.src }
+        }
+        if ($r.kind -eq 'ServiceDelete' -and (Invoke-ScExe @('query', [string]$r.op.name)).Code -ne 1060) {
+            $ok = $false
+            if ($bootedSince) { $lost += "service $($r.op.name)" }
+        }
+        if (-not $ok -and $lost.Count) {
+            $leftInPlace++
+            foreach ($x in $lost) { Write-RunLog "  left in place: $x (a boot has passed and the change is no longer queued; it did not happen)" }
+            continue
+        }
         if ($ok) {
             Add-JournalRecord @{ itemId = $r.itemId; category = $r.category; kind = "Resume-$($r.kind)"; resumeOf = $r.seq; op = $null; result = 'done' }
             # The busy file that held its folder in place has moved at boot: the folder is empty now.
@@ -3550,7 +3654,7 @@ function Invoke-LeftoversResume {
             if ($folder -and (Test-Path -LiteralPath $folder -PathType Container) -and -not @(Get-ChildItem -LiteralPath $folder -Force -ErrorAction SilentlyContinue).Count) {
                 $sddl = $null
                 try { $sddl = (Get-Acl -LiteralPath $folder).Sddl } catch { }
-                Remove-Item -LiteralPath $folder -Force -ErrorAction SilentlyContinue
+                try { [System.IO.Directory]::Delete($folder, $false) } catch { }
                 if (-not (Test-Path -LiteralPath $folder)) {
                     $dst = [System.IO.Path]::Combine((Get-QuarantineRoot $RunId $folder.Substring(0, 2)), $folder.Substring(3))
                     Add-JournalRecord @{ itemId = $r.itemId; category = $r.category; kind = 'FileQuarantine'; op = $r.op; backup = $null; result = 'done'; note = 'removed the folder emptied by the reboot'
@@ -3561,9 +3665,10 @@ function Invoke-LeftoversResume {
         }
         else { $still++; Write-RunLog "  still pending: [$($r.category)] $($r.kind)" }
     }
-    $meta.status = if ($still) { 'pending-reboot' } else { 'done' }
+    $meta.status = if ($leftInPlace) { 'resume-incomplete' } elseif ($still) { 'pending-reboot' } else { 'done' }
     ($meta | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $metaFile -Encoding UTF8
-    Write-RunLog "Resume of ${RunId}: $(if ($still) { "$still change(s) still wait on a reboot" } else { 'everything completed' })."
+    Write-RunLog "Resume of ${RunId}: $(if ($leftInPlace) { "$leftInPlace change(s) did not happen at boot (listed above; -Restore $RunId puts the rest back)" } elseif ($still) { "$still change(s) still wait on a reboot" } else { 'everything completed' })."
+    if ($leftInPlace) { return 1 }
     if ($still) { return 3010 }
     return 0
 }
@@ -3825,10 +3930,9 @@ function Start-LeftoversChild {
     # the redirected streams, read without blocking by the window's timer.
     param([string[]] $Arguments)
     $all = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:ScriptPath) + $Arguments
-    $quoted = @($all | ForEach-Object { if ($_ -match '[\s"]' -or $_ -eq '') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } })
     $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = (Get-Process -Id $PID).Path
-    $psi.Arguments = $quoted -join ' '
+    $psi.FileName = Get-PowerShellExe
+    $psi.Arguments = (@($all | ForEach-Object { ConvertTo-ArgvString $_ })) -join ' '
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $true
@@ -3839,7 +3943,12 @@ function Start-LeftoversChild {
 function Show-LeftoversGui {
     param($Policy)
     $ui = New-LeftoversForm -Policy $Policy
-    $work = Join-Path ([System.IO.Path]::GetTempPath()) ('leftovers-gui-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    # The window's scans live in the admin-only folder, not %TEMP%: the plan a scan writes is what Clean up
+    # then executes elevated, and the user's own non-elevated programs can write to %TEMP% (review 2026-09-26).
+    $guiRoot = Join-Path (Split-Path (Get-RunsRoot) -Parent) 'gui'
+    [void](New-Item -ItemType Directory -Force -Path $guiRoot)
+    Protect-Folder $guiRoot
+    $work = Join-Path $guiRoot ([guid]::NewGuid().ToString('N').Substring(0, 8))
     [void](New-Item -ItemType Directory -Force -Path $work)
     $all = @((Get-UninstallEntries (Get-LoadedUserSids)) | Where-Object { $_.DisplayName -and -not $_.SystemComponent } | Sort-Object DisplayName)
     $fill = {
@@ -3900,6 +4009,14 @@ function Show-LeftoversGui {
             $secs = [int]((Get-Date) - $state.Started).TotalSeconds
             $ui.Status.Text = ("{0}: {1} s  {2}" -f $state.Kind, $secs, [string]$state.Last)
             if ($state.Proc.HasExited -and -not $state.Read) { & $finish }
+        })
+    # Not while a run is going: closing would leave it working with nobody watching, its result unseen
+    # (review 2026-09-26).
+    $ui.Form.Add_FormClosing({
+            if ($state.Proc -and -not $state.Proc.HasExited) {
+                $_.Cancel = $true
+                [void][System.Windows.Forms.MessageBox]::Show("The $($state.Kind.ToLowerInvariant()) is still running. Wait for it to finish: closing now would leave it running with nobody watching.", 'Leftovers', 'OK', 'Warning')
+            }
         })
     $launch = {
         param([string] $Kind, [string[]] $ArgList)
@@ -3972,7 +4089,7 @@ function Show-LeftoversGui {
     [void]$ui.Form.ShowDialog()
     $timer.Dispose()
     $ui.Form.Dispose()
-    Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-TreeLongPath $work
     return 0
 }
 
@@ -4078,7 +4195,8 @@ function Invoke-Main {
     } else {
         $given = @($Name, $ProductCode, $UpgradeCode | Where-Object { $_ }).Count
         if ($given -ne 1) { Write-Host 'Name the app with exactly one of -Name, -ProductCode, -UpgradeCode (or -Plan). -List shows names.'; return 3 }
-        try { $appProfiles = @(Import-AppProfile -Extra $ProfilePath) } catch { Write-Host "Profile error: $($_.Exception.Message)"; return 3 }
+        # (A relaunched copy receives a list as one comma-joined argument.)
+        try { $appProfiles = @(Import-AppProfile -Extra @($ProfilePath | ForEach-Object { $_ -split ',' } | Where-Object { $_ })) } catch { Write-Host "Profile error: $($_.Exception.Message)"; return 3 }
         $built = New-LeftoversPlan -AppName $Name -AppProductCode $ProductCode -AppUpgradeCode $UpgradeCode -AppKeyword $Keyword -Say $say -AppProfiles $appProfiles
         if ($built.Code -ne 0) {
             Write-Host $built.Message
@@ -4120,14 +4238,24 @@ function Invoke-Main {
 
 if (-not $LibraryOnly) {
     $mode = $PSCmdlet.ParameterSetName
+    # .NET calls resolve relative paths against the process directory, not PowerShell's location, and a
+    # relaunched copy starts wherever .NET thinks it is: make every path absolute FIRST.
+    foreach ($pv in @('OutDir', 'Log', 'Plan', 'GuiSelfTest', 'PolicyFile')) {
+        $val = Get-Variable -Name $pv -ValueOnly
+        if ($val -and -not [System.IO.Path]::IsPathRooted($val)) {
+            $abs = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($val)
+            Set-Variable -Name $pv -Value $abs
+            if ($PSBoundParameters.ContainsKey($pv)) { $PSBoundParameters[$pv] = $abs }
+        }
+    }
+    if ($ProfilePath) { $PSBoundParameters['ProfilePath'] = @($ProfilePath | ForEach-Object { if ([System.IO.Path]::IsPathRooted($_)) { $_ } else { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($_) } }) }
     $relaunchArgs = ConvertTo-ArgumentList $PSBoundParameters
     # 64-bit Windows in a 32-bit host (Intune runs scripts 32-bit by default): System32 is redirected and
     # Program Files means Program Files (x86). Relaunch in the native host (review 2026-09-26).
     if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
         $native = Join-Path $env:SystemRoot 'Sysnative\WindowsPowerShell\v1.0\powershell.exe'
         if (Test-Path -LiteralPath $native) {
-            & $native -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath $relaunchArgs
-            exit $LASTEXITCODE
+            exit (Invoke-SelfRelaunch -Exe $native -HostArgs @('-NoProfile', '-ExecutionPolicy', 'Bypass') -ScriptArgs $relaunchArgs)
         }
         Write-Host 'Leftovers must run in 64-bit PowerShell on 64-bit Windows.'
         exit 3
@@ -4142,21 +4270,13 @@ if (-not $LibraryOnly) {
         }
         if (-not (Test-Elevated)) {
             # Double-clicked by an admin without elevation: ask for it (UAC) instead of failing.
-            $hostExe = (Get-Process -Id $PID).Path
-            try { Start-Process -FilePath $hostExe -Verb RunAs -ArgumentList @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $PSCommandPath + '"')) | Out-Null; exit 0 }
+            try { Start-Process -FilePath (Get-PowerShellExe) -Verb RunAs -ArgumentList ((@('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath) | ForEach-Object { ConvertTo-ArgvString $_ }) -join ' ') | Out-Null; exit 0 }
             catch { Write-Host 'Leftovers needs to run as an administrator.'; exit 3 }
         }
         # The window needs a single-threaded apartment (message loop, dialogs).
         if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
-            $hostExe = (Get-Process -Id $PID).Path
-            & $hostExe -NoProfile -STA -ExecutionPolicy Bypass -File $PSCommandPath $relaunchArgs
-            exit $LASTEXITCODE
+            exit (Invoke-SelfRelaunch -Exe (Get-PowerShellExe) -HostArgs @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass') -ScriptArgs $relaunchArgs)
         }
-    }
-    # .NET calls resolve relative paths against the process directory, not PowerShell's location.
-    foreach ($pv in @('OutDir', 'Log', 'Plan', 'GuiSelfTest')) {
-        $val = Get-Variable -Name $pv -ValueOnly
-        if ($val -and -not [System.IO.Path]::IsPathRooted($val)) { Set-Variable -Name $pv -Value ($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($val)) }
     }
     try {
         $code = Invoke-Main -Mode $mode

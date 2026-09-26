@@ -32,7 +32,14 @@ machine worse than it found it:
 5. Files and registry keys last, once nothing loads them.
 
 A file in use is moved at the next boot instead. The run then ends with exit code 3010; after the
-reboot, `-Resume <runId>` confirms everything finished.
+reboot, `-Resume <runId>` confirms everything finished (exit 1, with the list, if a boot-time change
+didn't happen: another reboot won't help then). Level 3 also stops the app's own programs still running
+from its folder; a restore doesn't restart them.
+
+`-Restore <runId>` undoes a run newest change first. If one change can't be undone (something new sits
+where a file was, a service still waits on a reboot), the restore stops right there and puts nothing
+older back, because older changes can depend on it. Fix the cause, run `-Restore` again, and it
+carries on from where it stopped.
 
 ## Run it
 

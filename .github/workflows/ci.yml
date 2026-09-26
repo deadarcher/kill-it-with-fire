@@ -63,7 +63,7 @@ jobs:
         shell: powershell
         run: |
           $failed = @()
-          foreach ($s in 'putty', 'profile', 'notepadpp', 'hooks', 'plan', 'policy', 'refusal', 'bitness', 'pending') {
+          foreach ($s in 'putty', 'profile', 'notepadpp', 'hooks', 'restorestop', 'plan', 'policy', 'refusal', 'bitness', 'pending') {
             Write-Host "=== $s"
             ./tests/Invoke-LabValidation.ps1 -Scenario $s -ConfirmThrowaway
             if ($LASTEXITCODE) { $failed += $s }
