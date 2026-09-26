@@ -1,0 +1,71 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Unit tests (${{ matrix.shell }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests
+        shell: ${{ matrix.shell }}
+        run: ./tests/Run-Tests.ps1
+
+  analyze:
+    name: PSScriptAnalyzer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Analyze the engine
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force
+          $r = @(Invoke-ScriptAnalyzer -Path ./Leftovers.ps1 -Severity Error, Warning)
+          $r | Format-Table Line, RuleName, Message -AutoSize | Out-String -Width 220 | Write-Host
+          if ($r.Count) { exit 1 }
+
+  lab:
+    # Destructive: installs, breaks and removes real apps on the runner, which is thrown away afterwards.
+    # The scenarios that need a reboot (resume, filter, credprov) run on a lab VM instead.
+    name: Lab scenarios (throwaway runner)
+    runs-on: windows-latest
+    needs: unit
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch pinned media
+        shell: pwsh
+        run: |
+          $media = @(
+            @{ Url = 'https://the.earth.li/~sgtatham/putty/0.81/w64/putty-64bit-0.81-installer.msi'; Sha = '6C297C89D32D7FB5C6D10B1DA2612C9557A5126715C4A78690D5D8067488F5F2' },
+            @{ Url = 'https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.6.4/npp.8.6.4.Installer.x64.exe'; Sha = '32DABD4169F6413B09CD2A643251B31C85B7948BD1C99C4B6D1F55F52163599F' },
+            @{ Url = 'https://www.7-zip.org/a/7z2409-x64.msi'; Sha = 'EC6AF1EA0367D16DDE6639A89A080A524CEBC4D4BEDFE00ED0CAC4B865A918D8' }
+          )
+          New-Item -ItemType Directory lab-media -Force | Out-Null
+          $ProgressPreference = 'SilentlyContinue'
+          foreach ($m in $media) {
+            $f = Join-Path lab-media (Split-Path $m.Url -Leaf)
+            Invoke-WebRequest $m.Url -OutFile $f
+            $h = (Get-FileHash $f -Algorithm SHA256).Hash
+            if ($h -ne $m.Sha) { throw "hash mismatch for $f : $h" }
+          }
+      - name: Run the scenarios
+        shell: powershell
+        run: |
+          $failed = @()
+          foreach ($s in 'putty', 'profile', 'notepadpp', 'hooks', 'plan', 'policy', 'refusal', 'bitness', 'pending') {
+            Write-Host "=== $s"
+            ./tests/Invoke-LabValidation.ps1 -Scenario $s -ConfirmThrowaway
+            if ($LASTEXITCODE) { $failed += $s }
+          }
+          if ($failed.Count) { Write-Host "FAILED: $($failed -join ', ')"; exit 1 }

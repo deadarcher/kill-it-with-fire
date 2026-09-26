@@ -1,0 +1,32 @@
+# A Leftovers profile: what one app keeps where identity matching can't see it. Copy to <App>.psd1 in
+# this folder (files ending .psd1 load on their own) or pass it with -ProfilePath.
+#
+# Rules the engine enforces whatever a profile says:
+#   - A profile only ADDS items. Every item still passes the protected-path list, the kept-path check
+#     (another product uses a path inside it) and the user-data tagging.
+#   - Machine registry keys must be under SOFTWARE\<Vendor>: never Microsoft, Policies, Classes,
+#     WOW6432Node (say View = 32 instead), SYSTEM or the other hives.
+#   - Services only. A driver needs identity evidence (its image in the app's folder), never a profile.
+#   - Per-user items apply to signed-in users only (their registry is loaded); AppData paths only, and
+#     a per-user PATH is always user data (it only goes with -IncludeUserData). A per-user registry key
+#     is user data when UserData = $true, otherwise an ordinary registry item.
+#
+# Every item needs a Why: it is printed as the evidence, next to what it removes. Write down where the
+# fact came from (vendor documentation, a support article, a lab capture), not just what it is.
+@{
+    Name  = 'Example App'
+    # All given conditions must match: regexes against the uninstall entry, or a list of ProductCodes.
+    Match = @{
+        DisplayName = '^Example App \d'
+        Publisher   = '^Example Corp'
+        # ProductCode = @('{00000000-0000-0000-0000-000000000000}')
+    }
+    Notes = 'Anything a technician should know before running it.'
+    Items = @(
+        @{ Kind = 'MachineRegistryKey'; Path = 'SOFTWARE\Example Corp\Example App'; View = 64; Why = 'machine settings (vendor KB 123)' }
+        @{ Kind = 'MachineFolder'; Path = '%ProgramData%\Example Corp\Example App'; Why = 'logs and license cache (vendor KB 123)' }
+        @{ Kind = 'Service'; Name = 'ExampleSvc'; Why = 'update service installed separately from the MSI' }
+        @{ Kind = 'UserRegistryKey'; Path = 'Software\Example Corp\Example App'; Why = 'per-user preferences'; UserData = $true }
+        @{ Kind = 'UserPath'; Path = 'AppData\Local\Example App'; Why = 'per-user cache' }
+    )
+}
