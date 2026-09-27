@@ -3919,6 +3919,9 @@ function Show-TextDialog {
     $tb.Text = ($Text -replace "(?<!`r)`n", "`r`n")
     $ok = New-Object System.Windows.Forms.Button; $ok.Text = 'OK'; $ok.Location = '760,480'; $ok.Size = '90,28'; $ok.Anchor = 'Bottom,Right'; $ok.DialogResult = 'OK'
     $d.Controls.Add($tb); $d.Controls.Add($ok); $d.AcceptButton = $ok
+    # Focus starts on OK: a TextBox that gets focus first selects all its text, and the output opened
+    # fully highlighted.
+    $d.ActiveControl = $ok; $tb.SelectionStart = 0; $tb.SelectionLength = 0
     [void]$d.ShowDialog($Owner)
     $d.Dispose()
 }
@@ -4076,6 +4079,10 @@ function Show-LeftoversGui {
                 foreach ($v in @($r.app, $r.level, $r.items, $r.status, $(if ($r.finished) { (ConvertTo-UtcDate $r.finished).ToString('yyyy-MM-dd HH:mm') } else { '' }))) { [void]$li.SubItems.Add([string]$v) }
                 $li.Tag = $r; [void]$lv.Items.Add($li)
             }
+            # The newest run starts selected. With nothing selected, the first Down key only focuses row 1
+            # visually and the second row gets picked: the lab drive restored the wrong run exactly that way.
+            $lv.HideSelection = $false
+            if ($lv.Items.Count) { $lv.Items[0].Selected = $true; $lv.Items[0].Focused = $true }
             $note = New-Object System.Windows.Forms.Label; $note.Location = '10,284'; $note.Size = '560,36'; $note.Anchor = 'Bottom,Left'
             $note.Text = if ($runs.Count) { 'Restore puts back everything the run changed, newest change first. Runs made without a backup are not listed.' } else { 'No runs to restore. Runs made without a backup are not listed.' }
             $go = New-Object System.Windows.Forms.Button; $go.Text = 'Restore'; $go.Location = '680,286'; $go.Size = '90,28'; $go.DialogResult = 'OK'; $go.Anchor = 'Bottom,Right'
