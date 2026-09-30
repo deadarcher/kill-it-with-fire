@@ -26,6 +26,12 @@
                  (the host reboots between phases and checks the keyboard device each time)
       credprov   a credential provider + the built-in password sign-in turned off; phases setup,
                  broken, cleaned, restored, final (the host reboots and tries a real sign-in)
+      npcap      a real NDIS network component (Npcap: netcfg -u, pnputil /delete-driver, the driver);
+                 phases setup, broken, cleaned, restored, final (the host installs Npcap through its
+                 wizard and reboots between phases; the network must work after every boot)
+      everything an app with a Windows service (voidtools Everything), uninstaller gone; restore round trip
+      sevenzip   an MSI with shell extensions (7-Zip), cached package gone (1612); other handlers untouched
+      zoom       a per-user install (Zoom, %APPDATA%, HKCU); profiles\Zoom.psd1 adds HKCU\Software\ZoomUMX
 
     Phases that follow a reboot read what the earlier phase saved in <StateDir>.
 
@@ -35,7 +41,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('putty', 'profile', 'notepadpp', 'hooks', 'restorestop', 'plan', 'policy', 'refusal', 'bitness', 'pending', 'resume', 'filter', 'credprov')]
+    [ValidateSet('putty', 'profile', 'notepadpp', 'hooks', 'restorestop', 'plan', 'policy', 'refusal', 'bitness', 'pending', 'resume', 'filter', 'credprov', 'npcap', 'everything', 'sevenzip', 'zoom')]
     [string] $Scenario,
     [string] $Phase = 'run',
     [string] $Engine,
@@ -210,6 +216,7 @@ function Get-OpFingerprint {
         }
         'FirewallRuleDelete' { $r = Get-NetFirewallRule -Name $Op.id -ErrorAction SilentlyContinue; if ($r) { return "rule:$($r.DisplayName)" } return 'absent' }
         'DriverPackageDelete' { if (Test-Path (Join-Path $env:SystemRoot "INF\$($Op.inf)")) { return 'inf:present' } return 'absent' }
+        'NetcfgUninstall' { if (Test-NetComponent ([string]$Op.componentId)) { return 'component:present' } return 'absent' }
         default { return "n/a:$kind" }
     }
 }
@@ -249,6 +256,36 @@ function Get-Uninstall {
     param([string] $DisplayNameLike)
     foreach ($root in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall')) {
         foreach ($k in @(Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue)) {
+            $p = Get-ItemProperty -LiteralPath $k.PSPath -ErrorAction SilentlyContinue
+            if ($p -and ($p.PSObject.Properties.Name -contains 'DisplayName') -and $p.DisplayName -like $DisplayNameLike) { return $p }
+        }
+    }
+    return $null
+}
+
+function Test-NetComponent {
+    # Independent of the engine: what netcfg itself lists.
+    param([string] $ComponentId)
+    return [bool](@(& netcfg.exe -s n) | Where-Object { $_ -match ('^\s*' + [regex]::Escape($ComponentId) + '\s') })
+}
+
+function Test-Network {
+    # The machine is still on the network: every adapter that was up is up, and a name resolves.
+    param([int] $UpBefore)
+    $up = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' }).Count
+    $dns = [bool](Resolve-DnsName www.microsoft.com -ErrorAction SilentlyContinue)
+    return [pscustomobject]@{ Ok = ($up -ge $UpBefore -and $dns); Detail = "$up adapter(s) up (was $UpBefore), DNS $(if ($dns) { 'resolves' } else { 'FAILS' })" }
+}
+
+function Get-DeviceErrors {
+    return @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Error' } | ForEach-Object { $_.FriendlyName })
+}
+
+function Get-UserUninstall {
+    # A per-user uninstall entry in any loaded user hive.
+    param([string] $DisplayNameLike)
+    foreach ($h in @(Get-ChildItem Registry::HKEY_USERS | Where-Object { $_.PSChildName -match '^S-1-5-21-[\d-]+$' })) {
+        foreach ($k in @(Get-ChildItem -LiteralPath "Registry::$($h.Name)\Software\Microsoft\Windows\CurrentVersion\Uninstall" -ErrorAction SilentlyContinue)) {
             $p = Get-ItemProperty -LiteralPath $k.PSPath -ErrorAction SilentlyContinue
             if ($p -and ($p.PSObject.Properties.Name -contains 'DisplayName') -and $p.DisplayName -like $DisplayNameLike) { return $p }
         }
@@ -645,28 +682,36 @@ switch ($Scenario) {
     }
 
     'restorestop' {
-        # A restore that can't undo one change must STOP there (older changes may depend on it), and a
-        # rerun, once the cause is gone, must finish the job.
+        # A restore that can't undo one change: changes that can't depend on it still come back, the
+        # services, drivers and logon hooks that could (their program is in the blocked folder) are held
+        # back, the blocker is never overwritten, and a rerun once the cause is gone finishes the job.
+        # (Until 2026-09-29 the first failure stopped everything older, on every rerun.)
         $name = 'Leftovers Restore Test'
         $folder = 'C:\Program Files\LeftoversRestoreTest'
-        New-TestApp 'LeftoversRestoreTest' $name $folder @('a.txt', 'b.txt')
+        $svc = 'LtRestoreSvc'
+        New-TestApp 'LeftoversRestoreTest' $name $folder @('a.txt', 'b.txt', 'svc.exe')
+        & sc.exe create $svc type= own start= demand binPath= "`"$folder\svc.exe`"" DisplayName= 'Leftovers Restore Test' | Out-Null
         try {
             $r = Invoke-Engine @('-Name', $name, '-Level', '3', '-Force', '-Quiet')
             Check 'L3 exit 0' ($r.Code -eq 0) "exit $($r.Code)"
             $run = Get-NewestRun $started
-            Check 'L3: folder and entry gone' (-not (Test-Path $folder) -and -not (Get-Uninstall $name))
+            Check 'L3: folder, entry and service gone' (-not (Test-Path $folder) -and -not (Get-Uninstall $name) -and -not (Get-Service $svc -ErrorAction SilentlyContinue))
             # Something new appears where the folder was: the restore must not overwrite it.
             New-Item -ItemType Directory -Force -Path $folder | Out-Null
             Set-Content -LiteralPath (Join-Path $folder 'new.txt') -Value 'someone else' -Encoding ASCII
             $r = Invoke-Engine @('-Restore', $run.runId, '-Force', '-Quiet')
-            Check 'restore with a blocker: exit 1' ($r.Code -eq 1) "exit $($r.Code)"
-            Check 'restore stopped at the blocked folder: nothing older (the entry) was put back' (-not (Get-Uninstall $name))
+            Check 'restore with a blocker: exit 1 (not finished)' ($r.Code -eq 1) "exit $($r.Code)"
             Check 'the blocker was not overwritten' ((Get-Content -LiteralPath (Join-Path $folder 'new.txt')) -eq 'someone else')
+            Check 'an independent change (the uninstall entry) still came back' ([bool](Get-Uninstall $name))
+            Check 'the service, whose program is in the blocked folder, was held back' (-not (Get-Service $svc -ErrorAction SilentlyContinue))
             [System.IO.Directory]::Delete($folder, $true)
             $r = Invoke-Engine @('-Restore', $run.runId, '-Force', '-Quiet')
             Check 'rerun after the cause is gone: exit 0' ($r.Code -eq 0) "exit $($r.Code)"
-            Check 'rerun: folder and entry back' ((Test-Path (Join-Path $folder 'a.txt')) -and [bool](Get-Uninstall $name))
-        } finally { Remove-TestApp 'LeftoversRestoreTest' $folder }
+            Check 'rerun: folder, entry and service back' ((Test-Path (Join-Path $folder 'a.txt')) -and [bool](Get-Uninstall $name) -and [bool](Get-Service $svc -ErrorAction SilentlyContinue))
+        } finally {
+            & sc.exe delete $svc | Out-Null
+            Remove-TestApp 'LeftoversRestoreTest' $folder
+        }
     }
 
     'policy' {
@@ -861,7 +906,7 @@ switch ($Scenario) {
                 Check 'no device in an error state' ($bad.Count -eq 0) (@($bad | ForEach-Object { $_.FriendlyName }) -join ', ')
                 $run = Read-State 'filter-run'
                 $r = Invoke-Engine @('-Restore', $run.runId, '-Force', '-Quiet')
-                Check 'restore exit 0' ($r.Code -eq 0) "exit $($r.Code)"
+                Check 'restore exit 3010 (a filter only joins the device stack at boot)' ($r.Code -eq 3010) "exit $($r.Code)"
                 $plan = Get-Content -LiteralPath (Join-Path $StateDir 'filter-plan.json') -Raw | ConvertFrom-Json
                 Compare-State (ConvertTo-Ordered (Read-State 'filter-s0')) (Get-PlanState (Get-SelectedItems $plan 3)) 'restore: filter entry, driver service, files and entry back exactly'
             }
@@ -878,6 +923,250 @@ switch ($Scenario) {
                 Check 'final: nothing of the test app is left' (-not (Test-Path $folder) -and -not (Get-Uninstall $name) -and -not (Get-Service $svc -ErrorAction SilentlyContinue))
             }
         }
+    }
+
+    'npcap' {
+        # A REAL network component: Npcap 1.86 (NDIS lightweight filter INSECURE_NPCAP, driver package
+        # oemNN.inf, kernel driver npcap.sys), installed through its wizard by the host, uninstaller
+        # deleted. Removing it in the wrong order, or the wrong way (deleting the service under a bound
+        # filter), leaves a machine with no network. The host reboots between phases.
+        $name = 'Npcap'
+        $root = 'C:\Program Files\Npcap'
+        $cid = 'INSECURE_NPCAP'
+        $inf = { @(Get-ChildItem (Join-Path $env:SystemRoot 'INF\oem*.inf') | Where-Object { Select-String -LiteralPath $_.FullName -Pattern $cid -SimpleMatch -Quiet } | ForEach-Object Name) }
+        $svcState = { $q = (& sc.exe query npcap) -join ' '; if ($LASTEXITCODE -eq 1060) { 'absent' } elseif ($q -match 'RUNNING') { 'running' } else { 'stopped' } }
+        $resumeIfNeeded = {
+            $run = Read-State 'npcap-run'
+            if ([int]$run.code -eq 3010) {
+                $r = Invoke-Engine @('-Resume', $run.runId)
+                Check 'after the reboot, -Resume confirms every pending change happened: exit 0' ($r.Code -eq 0) "exit $($r.Code)"
+            }
+        }
+        switch ($Phase) {
+            'setup' {
+                Check 'precondition: Npcap is installed (component, driver package, running driver)' ((Test-NetComponent $cid) -and @(& $inf).Count -ge 1 -and (& $svcState) -eq 'running') "inf $((& $inf) -join ','), driver $(& $svcState)"
+                Check 'precondition: Npcap is bound to the adapters' (@(Get-NetAdapterBinding -ComponentID $cid -ErrorAction SilentlyContinue | Where-Object Enabled).Count -ge 1)
+                $up = @(Get-NetAdapter | Where-Object { $_.Status -eq 'Up' }).Count
+                $n = Test-Network $up
+                Check 'precondition: the network works' $n.Ok $n.Detail
+                Save-State 'npcap-net' @{ up = $up }
+                if (Test-Path "$root\uninstall.exe") { Remove-Item "$root\uninstall.exe" -Force }
+                Check 'broken: the uninstaller is gone, the entry still points at it' ((Get-Uninstall $name) -and -not (Test-Path "$root\uninstall.exe"))
+            }
+            'broken' {
+                $scan = Join-Path $StateDir 'npcap-scan'
+                $r = Invoke-Engine @('-Name', $name, '-Level', '0', '-OutDir', $scan, '-Quiet')
+                Check 'scan exit 0' ($r.Code -eq 0) "exit $($r.Code)"
+                $plan = Get-Plan $scan
+                $nc = @($plan.items | Where-Object { $_.category -eq 'NetworkComponent' })
+                $pk = @($plan.items | Where-Object { $_.category -eq 'DriverPackage' -and $_.op })
+                $dv = @($plan.items | Where-Object { $_.category -eq 'Driver' })
+                $infNow = @(& $inf)
+                Check 'plan: the network component, removed with netcfg -u' ($nc.Count -eq 1 -and $nc[0].op.kind -eq 'NetcfgUninstall' -and $nc[0].op.componentId -eq $cid)
+                Check 'plan: the component keeps the INF Windows recorded for it' ($nc.Count -eq 1 -and $infNow -contains $nc[0].op.inf) "$($nc[0].op.inf) of $($infNow -join ',')"
+                Check 'plan: the driver package' ($pk.Count -ge 1 -and $infNow -contains $pk[0].op.inf)
+                Check 'plan: the kernel driver' ($dv.Count -eq 1 -and $dv[0].op.name -eq 'npcap')
+                Check 'plan: component BEFORE package BEFORE driver' ($nc.Count -and $pk.Count -and $dv.Count -and $nc[0].order -lt $pk[0].order -and $pk[0].order -lt $dv[0].order)
+                Check 'plan: nothing Microsoft in the network stack is touched' (@($plan.items | Where-Object { $_.op -and ($_.target -match '(?i)\bms_|ndiscap|tcpip|wfplwf') }).Count -eq 0)
+                $sel = Get-SelectedItems $plan 3 -Review
+                Save-State 'npcap-s0' (Get-PlanState $sel)
+                Copy-Item -LiteralPath (Join-Path $scan 'plan.json') -Destination (Join-Path $StateDir 'npcap-plan.json') -Force
+                $r = Invoke-Engine @('-Name', $name, '-Level', '3', '-IncludeReview', '-Force', '-Quiet')
+                Check 'L3 (with the reviewed driver items) exit 0 or 3010' ($r.Code -in @(0, 3010)) "exit $($r.Code)"
+                $run = Get-NewestRun $started
+                Save-State 'npcap-run' @{ runId = $run.runId; code = $r.Code }
+                $j = @(Get-Journal $run.runId | Where-Object { $_.kind -in @('NetcfgUninstall', 'DriverPackageDelete', 'ServiceDelete') -and $_.category -in @('NetworkComponent', 'DriverPackage', 'Driver') })
+                Check 'journal: netcfg -u ran first, then the package, then the driver' ((($j | ForEach-Object { $_.kind }) -join ',') -eq 'NetcfgUninstall,DriverPackageDelete,ServiceDelete') (($j | ForEach-Object { "$($_.kind)=$($_.result)" }) -join ', ')
+                Check 'L3: npcap.sys is out of System32\drivers (netcfg -u leaves it; the run quarantines it)' (-not (Test-Path (Join-Path $env:SystemRoot 'System32\drivers\npcap.sys')))
+                Check 'L3: netcfg no longer lists the component' (-not (Test-NetComponent $cid))
+                Check 'L3: the driver package is gone' (@(& $inf).Count -eq 0) ((& $inf) -join ',')
+                $n = Test-Network ([int](Read-State 'npcap-net').up)
+                Check 'L3: the network still works, before any reboot' $n.Ok $n.Detail
+            }
+            'cleaned' {
+                & $resumeIfNeeded
+                $n = Test-Network ([int](Read-State 'npcap-net').up)
+                Check 'after the reboot: the network works' $n.Ok $n.Detail
+                $bad = @(Get-DeviceErrors)
+                Check 'after the reboot: no device in an error state' ($bad.Count -eq 0) ($bad -join ', ')
+                Check 'after the reboot: component, package and driver are all gone' (-not (Test-NetComponent $cid) -and @(& $inf).Count -eq 0 -and (& $svcState) -eq 'absent' -and -not (Test-Path (Join-Path $env:SystemRoot 'System32\drivers\npcap.sys'))) "driver $(& $svcState)"
+                Check 'after the reboot: folder and entry gone' (-not (Test-Path $root) -and -not (Get-Uninstall $name))
+                $run = Read-State 'npcap-run'
+                $r = Invoke-Engine @('-Restore', $run.runId, '-Force', '-Quiet')
+                Check 'restore exit 0 or 3010' ($r.Code -in @(0, 3010)) "exit $($r.Code)"
+                $plan = Get-Content -LiteralPath (Join-Path $StateDir 'npcap-plan.json') -Raw | ConvertFrom-Json
+                # The driver SERVICE is the one item not compared byte for byte: netcfg -u deletes it itself,
+                # so the run never exported it, and on restore netcfg -l re-creates it from the INF (same
+                # service, install-time values rewritten). It is checked by what matters instead: present,
+                # the same npcap.sys (hash), and loaded and bound after the next boot (phase 'restored').
+                $drvIds = @($plan.items | Where-Object { $_.category -eq 'Driver' } | ForEach-Object { "$($_.id).0" })
+                $before = ConvertTo-Ordered (Read-State 'npcap-s0'); $after = Get-PlanState (Get-SelectedItems $plan 3 -Review)
+                foreach ($d in $drvIds) {
+                    $fileSame = ([string]$before[$d]).Split('|')[-1] -eq ([string]$after[$d]).Split('|')[-1]
+                    Check 'restore: the driver service is back, with the identical npcap.sys' ((& $svcState) -ne 'absent' -and $fileSame) "$($before[$d]) -> $($after[$d])"
+                    $before.Remove($d); $after.Remove($d)
+                }
+                Compare-State $before $after 'restore: component, package, task, files and entry all back exactly'
+                $n = Test-Network ([int](Read-State 'npcap-net').up)
+                Check 'restore: the network still works' $n.Ok $n.Detail
+            }
+            'restored' {
+                $n = Test-Network ([int](Read-State 'npcap-net').up)
+                Check 'after the reboot: the network works with Npcap back' $n.Ok $n.Detail
+                $bad = @(Get-DeviceErrors)
+                Check 'after the reboot: no device in an error state' ($bad.Count -eq 0) ($bad -join ', ')
+                Check 'restore was faithful: Npcap is loaded and bound again' ((Test-NetComponent $cid) -and (& $svcState) -eq 'running' -and @(Get-NetAdapterBinding -ComponentID $cid -ErrorAction SilentlyContinue | Where-Object Enabled).Count -ge 1) "driver $(& $svcState)"
+                Check 'restore was faithful: still broken the same way (entry, no uninstaller)' ((Get-Uninstall $name) -and (Test-Path $root) -and -not (Test-Path "$root\uninstall.exe"))
+                $r = Invoke-Engine @('-Name', $name, '-Level', '3', '-IncludeReview', '-Force', '-Quiet')
+                Check 'L3 again exit 0 or 3010' ($r.Code -in @(0, 3010)) "exit $($r.Code)"
+                $run = Get-NewestRun $started
+                Save-State 'npcap-run' @{ runId = $run.runId; code = $r.Code }
+            }
+            'final' {
+                & $resumeIfNeeded
+                $n = Test-Network ([int](Read-State 'npcap-net').up)
+                Check 'final: the network works' $n.Ok $n.Detail
+                $bad = @(Get-DeviceErrors)
+                Check 'final: no device in an error state' ($bad.Count -eq 0) ($bad -join ', ')
+                Check 'final: nothing of Npcap is left' (-not (Test-NetComponent $cid) -and @(& $inf).Count -eq 0 -and (& $svcState) -eq 'absent' -and -not (Test-Path $root) -and -not (Get-Uninstall $name) -and -not (Get-ScheduledTask -TaskName npcapwatchdog -ErrorAction SilentlyContinue))
+            }
+        }
+    }
+
+    'everything' {
+        # An app with a Windows service: voidtools Everything 1.4 (NSIS, service "Everything" running from
+        # the install folder), uninstaller deleted.
+        $name = 'Everything 1.4*'
+        $root = 'C:\Program Files\Everything'
+        if (-not (Get-Uninstall $name)) {
+            $p = Start-Process -FilePath (Join-Path $Media 'Everything-x64-Setup.exe') -ArgumentList '/S' -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw "Everything install failed: $($p.ExitCode)" }
+            Start-Sleep -Seconds 3
+        }
+        if (Test-Path "$root\Uninstall.exe") { Remove-Item "$root\Uninstall.exe" -Force }
+        $full = (Get-Uninstall $name).DisplayName
+        Check 'precondition: Everything installed, its service running, its uninstaller gone' ((Get-Service Everything -ErrorAction SilentlyContinue).Status -eq 'Running' -and -not (Test-Path "$root\Uninstall.exe"))
+        $scan = Join-Path $StateDir 'everything-scan'
+        $r = Invoke-Engine @('-Name', $full, '-Level', '0', '-OutDir', $scan, '-Quiet')
+        Check 'scan exit 0' ($r.Code -eq 0) "exit $($r.Code)"
+        $plan = Get-Plan $scan
+        $sv = @($plan.items | Where-Object { $_.category -eq 'Service' })
+        Check 'plan: the Everything service, tied by its program path (not review)' ($sv.Count -eq 1 -and $sv[0].op.name -eq 'Everything' -and -not $sv[0].review)
+        Check 'plan: no per-user folder outside the UserData opt-in' (@($plan.items | Where-Object { $_.category -eq 'AppDataFolder' -and $_.group -ne 'UserData' }).Count -eq 0)
+        $sel = Get-SelectedItems $plan 3
+        $s0 = Get-PlanState $sel
+        $r = Invoke-Engine @('-Name', $full, '-Level', '3', '-Force', '-Quiet')
+        Check 'L3 exit 0' ($r.Code -eq 0) "exit $($r.Code)"
+        $run = Get-NewestRun $started
+        Check 'L3: the service is gone, and nothing runs from the folder' (-not (Get-Service Everything -ErrorAction SilentlyContinue) -and -not @(Get-Process Everything -ErrorAction SilentlyContinue).Count)
+        Check 'L3: folder, entry and Run value gone' (-not (Test-Path $root) -and -not (Get-Uninstall $name) -and -not ((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -ErrorAction SilentlyContinue).PSObject.Properties.Name -contains 'Everything'))
+        $r = Invoke-Engine @('-Restore', $run.runId, '-Force', '-Quiet')
+        Check 'restore exit 0' ($r.Code -eq 0) "exit $($r.Code)"
+        Compare-State $s0 (Get-PlanState $sel) 'restore: every item back exactly as it was (files hashed)'
+        Start-Sleep -Seconds 3
+        Check 'restore: the service is back and running again' ((Get-Service Everything -ErrorAction SilentlyContinue).Status -eq 'Running')
+        Check 'restore: still broken the same way (no uninstaller)' ((Get-Uninstall $name) -and -not (Test-Path "$root\Uninstall.exe"))
+    }
+
+    'sevenzip' {
+        # An MSI with shell extensions: 7-Zip (context menu and drag-drop handlers under *, Directory,
+        # Folder and Drive, a COM class in both views, the Approved list). Broken the PuTTY way: cached
+        # package deleted, msiexec /x = 1612. The cached package is kept aside and put back at the end.
+        # Only ever break a 7-Zip THIS scenario installed from a throwaway copy (the marker file). Any other
+        # 7-Zip may have its install source still reachable, and then msiexec /x re-caches from it and REALLY
+        # uninstalls: that happened twice on 2026-09-29. A foreign 7-Zip gets a normal uninstall first.
+        $marker = Join-Path $StateDir '7zip-ours.txt'
+        $z = Get-Uninstall '7-Zip*'
+        if ($z -and -not (Test-Path -LiteralPath $marker)) {
+            if (($z.PSObject.Properties.Name -contains 'WindowsInstaller') -and $z.WindowsInstaller -eq 1) { [void](Invoke-Msiexec "/x $($z.PSChildName) /qn /norestart") }
+            elseif ($z.PSObject.Properties.Name -contains 'UninstallString') { [void](Start-Process -FilePath ($z.UninstallString.Trim('"')) -ArgumentList '/S' -Wait -PassThru) }
+            $z = Get-Uninstall '7-Zip*'
+        }
+        if (-not $z) {
+            # From a throwaway copy that is deleted below, like PuTTY: with the original source still on
+            # disk, msiexec /x re-caches from it and REALLY uninstalls (it did, 2026-09-29).
+            $src7 = Join-Path $StateDir '7zip-source.msi'
+            Copy-Item -LiteralPath (Join-Path $Media '7z2409-x64.msi') -Destination $src7 -Force
+            Check 'precondition: a 7-Zip MSI is installed' ((Invoke-Msiexec "/i `"$src7`" /qn /norestart") -eq 0)
+            Remove-Item -LiteralPath $src7 -Force
+            Set-Content -LiteralPath $marker -Value 'installed by the sevenzip scenario from a deleted throwaway copy' -Encoding ASCII
+            $z = Get-Uninstall '7-Zip*'
+        }
+        $pc = $z.PSChildName
+        $clsid = '{23170F69-40C1-278A-1000-000100020000}'
+        $handlers = @('*\shellex\ContextMenuHandlers\7-Zip', 'Directory\shellex\ContextMenuHandlers\7-Zip', 'Folder\ShellEx\ContextMenuHandlers\7-Zip', 'Directory\shellex\DragDropHandlers\7-Zip', 'Drive\shellex\DragDropHandlers\7-Zip')
+        $present = { @($handlers | Where-Object { Test-Path -LiteralPath "HKLM:\SOFTWARE\Classes\$_" }).Count }
+        $others = { @(Get-ChildItem -LiteralPath 'HKLM:\SOFTWARE\Classes\*\shellex\ContextMenuHandlers' | Where-Object { $_.PSChildName -ne '7-Zip' } | ForEach-Object PSChildName) -join ',' }
+        $approved = { @((Get-Item 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved').GetValueNames() | Where-Object { $_ -ne $clsid }).Count }
+        # Ask Windows Installer where the cached package is. A registry walk for it came back empty on
+        # 2026-09-29, and the 1612 check below then ran msiexec /x against a HEALTHY 7-Zip and really
+        # uninstalled it. The break is now confirmed before msiexec /x is ever run.
+        $wi = New-Object -ComObject WindowsInstaller.Installer
+        $local = [string]$wi.GetType().InvokeMember('ProductInfo', [System.Reflection.BindingFlags]::GetProperty, $null, $wi, @($pc, 'LocalPackage'))
+        $aside = Join-Path $StateDir '7zip-cached.msi'
+        if ($local -and (Test-Path -LiteralPath $local)) { Copy-Item -LiteralPath $local -Destination $aside -Force; Remove-Item -LiteralPath $local -Force }
+        if (-not $local -or (Test-Path -LiteralPath $local)) { throw "could not break 7-Zip: cached package '$local' not found or still there; refusing to run msiexec /x on a healthy install" }
+        Check 'precondition: 7-Zip is broken (msiexec /x = 1612) and its shell extension registered' ((Invoke-Msiexec "/x $pc /qn /norestart") -eq 1612 -and (& $present) -eq $handlers.Count)
+        $othersBefore = & $others; $approvedBefore = & $approved
+        try {
+            $scan = Join-Path $StateDir '7zip-scan'
+            $r = Invoke-Engine @('-ProductCode', $pc, '-Level', '0', '-OutDir', $scan, '-Quiet')
+            Check 'scan exit 0' ($r.Code -eq 0) "exit $($r.Code)"
+            $plan = Get-Plan $scan
+            Check 'plan: every 7-Zip shell handler, the Approved entry and the COM class' (@($plan.items | Where-Object { $_.category -eq 'ShellExtension' }).Count -ge ($handlers.Count + 1) -and @($plan.items | Where-Object { $_.category -eq 'ComClass' -and $_.target -like "*$clsid" }).Count -ge 1)
+            $sel = Get-SelectedItems $plan 3
+            $s0 = Get-PlanState $sel
+            $r = Invoke-Engine @('-ProductCode', $pc, '-Level', '3', '-Force', '-Quiet')
+            Check 'L3 exit 0' ($r.Code -eq 0) "exit $($r.Code)"
+            $run = Get-NewestRun $started
+            Check 'L3: Windows Installer no longer knows it' ((Get-MsiProductState $pc) -eq -1)
+            Check 'L3: every 7-Zip shell handler and the COM class are gone' ((& $present) -eq 0 -and -not (Test-Path -LiteralPath "HKLM:\SOFTWARE\Classes\CLSID\$clsid"))
+            Check 'L3: every OTHER context menu handler untouched' ((& $others) -eq $othersBefore) (& $others)
+            Check 'L3: every other Approved shell extension untouched' ((& $approved) -eq $approvedBefore) "$(& $approved) (was $approvedBefore)"
+            Check 'L3: the folder is gone' (-not (Test-Path 'C:\Program Files\7-Zip'))
+            $r = Invoke-Engine @('-Restore', $run.runId, '-Force', '-Quiet')
+            Check 'restore exit 0' ($r.Code -eq 0) "exit $($r.Code)"
+            Compare-State $s0 (Get-PlanState $sel) 'restore: every item back exactly as it was (files hashed)'
+            Check 'restore: the shell extension is registered again' ((& $present) -eq $handlers.Count -and (Test-Path -LiteralPath "HKLM:\SOFTWARE\Classes\CLSID\$clsid"))
+            $t = Start-Process 'C:\Program Files\7-Zip\7z.exe' -ArgumentList 'i' -Wait -PassThru -WindowStyle Hidden
+            Check 'restore: 7z.exe runs' ($t.ExitCode -eq 0) "exit $($t.ExitCode)"
+            Check 'restore: broken exactly as before (msiexec /x = 1612)' ((Invoke-Msiexec "/x $pc /qn /norestart") -eq 1612)
+        } finally {
+            # Leave it healthy for the scenarios that want a working 7-Zip MSI.
+            if ((Test-Path -LiteralPath $aside) -and $local -and -not (Test-Path -LiteralPath $local)) { Copy-Item -LiteralPath $aside -Destination $local -Force }
+        }
+    }
+
+    'zoom' {
+        # A per-user install: Zoom Workplace via ZoomInstaller.exe (the host installs it as this user).
+        # %APPDATA%\Zoom\bin and \uninstall, an HKCU uninstall entry, HKCU protocol handlers, a per-user
+        # scheduled task, and HKCU\Software\ZoomUMX, which only profiles\Zoom.psd1 knows about. The user
+        # is signed in (this session), so the hive is loaded. Uninstaller deleted.
+        $name = 'Zoom Workplace'
+        $zroot = Join-Path $env:APPDATA 'Zoom'
+        $sid = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+        $umx = "Registry::HKEY_USERS\$sid\Software\ZoomUMX"
+        $task = { @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like "ZoomUpdateTaskUser-$sid" }).Count }
+        if (Test-Path "$zroot\uninstall\Installer.exe") { Remove-Item "$zroot\uninstall\Installer.exe" -Force }
+        Check 'precondition: Zoom installed per user, its uninstaller gone' ((Get-UserUninstall $name) -and (Test-Path "$zroot\bin\Zoom.exe") -and -not (Test-Path "$zroot\uninstall\Installer.exe") -and (Test-Path $umx))
+        $scan = Join-Path $StateDir 'zoom-scan'
+        $r = Invoke-Engine @('-Name', $name, '-Level', '0', '-OutDir', $scan, '-Quiet')
+        Check 'scan exit 0' ($r.Code -eq 0) "exit $($r.Code)"
+        $plan = Get-Plan $scan
+        Check 'plan: the per-user uninstall entry' (@($plan.items | Where-Object { $_.category -eq 'UninstallEntry' -and $_.target -like "HKU\$sid\*" }).Count -eq 1)
+        Check 'plan: the profile adds HKCU\Software\ZoomUMX' (@($plan.items | Where-Object { $_.target -like '*\Software\ZoomUMX' -and $_.op }).Count -eq 1)
+        Check 'plan: the zoommtg protocol handler and the per-user task' (@($plan.items | Where-Object { $_.target -like '*_Classes\zoommtg' }).Count -eq 1 -and @($plan.items | Where-Object { $_.category -eq 'ScheduledTask' }).Count -eq 1)
+        $sel = Get-SelectedItems $plan 3
+        $s0 = Get-PlanState $sel
+        $r = Invoke-Engine @('-Name', $name, '-Level', '3', '-Force', '-Quiet')
+        Check 'L3 exit 0' ($r.Code -eq 0) "exit $($r.Code)"
+        $run = Get-NewestRun $started
+        Check 'L3: entry, program folders, ZoomUMX, protocol handler and task all gone' (-not (Get-UserUninstall $name) -and -not (Test-Path "$zroot\bin") -and -not (Test-Path $umx) -and -not (Test-Path "Registry::HKEY_USERS\$($sid)_Classes\zoommtg") -and (& $task) -eq 0)
+        Check 'L3: the rest of %APPDATA%\Zoom (user data) left alone without -IncludeUserData' (Test-Path $zroot)
+        $r = Invoke-Engine @('-Restore', $run.runId, '-Force', '-Quiet')
+        Check 'restore exit 0' ($r.Code -eq 0) "exit $($r.Code)"
+        Compare-State $s0 (Get-PlanState $sel) 'restore: every item back exactly as it was (files hashed)'
+        Check 'restore: Zoom is back for this user, still without its uninstaller' ((Get-UserUninstall $name) -and (Test-Path "$zroot\bin\Zoom.exe") -and (Test-Path $umx) -and (& $task) -eq 1 -and -not (Test-Path "$zroot\uninstall\Installer.exe"))
     }
 
     'credprov' {

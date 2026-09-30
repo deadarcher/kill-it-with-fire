@@ -196,7 +196,7 @@ param(
 )
 
 Set-StrictMode -Version 2.0
-$script:ToolVersion = '0.2.0'
+$script:ToolVersion = '0.3.0'
 $script:ScriptPath = $PSCommandPath
 
 # =====================================================================================================
@@ -809,6 +809,7 @@ function Format-CommandLine {
 
 $script:Base = @{}
 $script:Unreadable = @{}
+$script:InfUsers = $null   # Get-InfDeviceUsers cache, reset per scan
 
 function Initialize-RegistryBase {
     $script:Base['HKLM64'] = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
@@ -842,6 +843,39 @@ function Get-ValueSafe {
     param($Key, [string] $Name)
     if ($null -eq $Key) { return $null }
     try { return $Key.GetValue($Name, $null) } catch { return $null }
+}
+
+function Get-InfDeviceUsers {
+    # Who uses a driver package: every device (and network component) driver key under Control\Class
+    # whose InfPath is this INF, named by its ComponentId or MatchingDeviceId. Present or not: a device
+    # that is unplugged today still loses its driver. Built once per scan.
+    param([string] $Inf)
+    if ($null -eq $script:InfUsers) {
+        $script:InfUsers = @{}
+        $ck = Open-Key 'HKLM64' 'SYSTEM\CurrentControlSet\Control\Class' 'device classes'
+        foreach ($g in (Get-SubKeyNamesSafe $ck 'device classes')) {
+            $gk = $null; try { $gk = $ck.OpenSubKey($g, $false) } catch { }
+            foreach ($n in (Get-SubKeyNamesSafe $gk 'device classes' | Where-Object { $_ -match '^\d{4}$' })) {
+                $dk = $null; try { $dk = $gk.OpenSubKey($n, $false) } catch { }
+                if ($null -eq $dk) { continue }
+                $ip = [string](Get-ValueSafe $dk 'InfPath')
+                if ($ip) {
+                    $who = [string](Get-ValueSafe $dk 'ComponentId')
+                    if (-not $who) { $who = [string](Get-ValueSafe $dk 'MatchingDeviceId') }
+                    if (-not $who) { $who = [string](Get-ValueSafe $dk 'DriverDesc') }
+                    if (-not $who) { $who = "$g\$n" }
+                    if (-not $script:InfUsers.ContainsKey($ip.ToLowerInvariant())) { $script:InfUsers[$ip.ToLowerInvariant()] = @() }
+                    $script:InfUsers[$ip.ToLowerInvariant()] += $who
+                }
+                Close-Key $dk
+            }
+            Close-Key $gk
+        }
+        Close-Key $ck
+    }
+    $k = $Inf.ToLowerInvariant()
+    if ($script:InfUsers.ContainsKey($k)) { return @($script:InfUsers[$k] | Select-Object -Unique) }
+    return @()
 }
 
 function Close-Key {
@@ -1262,7 +1296,7 @@ function New-LeftoversPlan {
     # 3 = not found / bad input. Writes nothing.
     param([string] $AppName, [string] $AppProductCode, [string] $AppUpgradeCode, [string] $AppKeyword, [scriptblock] $Say, [object[]] $AppProfiles)
     if (-not $Say) { $Say = { param($m) } }
-    $script:Items.Clear(); $script:ItemKeys.Clear(); $script:Kept.Clear(); $script:Warnings.Clear(); $script:Unreadable = @{}
+    $script:Items.Clear(); $script:ItemKeys.Clear(); $script:Kept.Clear(); $script:Warnings.Clear(); $script:Unreadable = @{}; $script:InfUsers = $null
     $script:OurFiles.Clear(); $script:MatchRoots = @(); $script:MsiReadErrors = @()
     $runId = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + ([guid]::NewGuid().ToString('N').Substring(0, 6))
 
@@ -1787,6 +1821,10 @@ function New-LeftoversPlan {
                 $ik = $null; try { $ik = $nk.OpenSubKey($inst, $false) } catch { continue }
                 if ($null -eq $ik) { continue }
                 $cid = [string](Get-ValueSafe $ik 'ComponentId')
+                # The INF this component was installed from, as Windows recorded it. It is the one to export
+                # and reinstall on restore; matching INF text instead picked whichever oem*.inf mentioning
+                # the id sorted last, which can be a stale driver store copy (review 2026-09-29).
+                $infPath = [string](Get-ValueSafe $ik 'InfPath')
                 $ndi = $null; try { $ndi = $ik.OpenSubKey('Ndi', $false) } catch { }
                 $svc = [string](Get-ValueSafe $ndi 'Service')
                 if ($cid -and $svc -and ($ourServiceNames -contains $svc)) {
@@ -1794,7 +1832,7 @@ function New-LeftoversPlan {
                         -Action "netcfg -u $cid (unbinds it cleanly; never delete the service directly)" `
                         -Evidence "network component bound to our service '$svc'" -Risk 'critical' `
                         -Review:($reviewServices.Contains($svc)) -Note $(if ($reviewServices.Contains($svc)) { "needs review: service '$svc' is tied by vendor only" } else { $null }) `
-                        -Op ([ordered]@{ kind = 'NetcfgUninstall'; componentId = $cid; netClass = $nc.C; inf = $null })
+                        -Op ([ordered]@{ kind = 'NetcfgUninstall'; componentId = $cid; netClass = $nc.C; inf = $(if ($infPath -match '^(?i)oem\d+\.inf$') { $infPath } else { $null }) })
                     if ($item) { $ourNetComponents[$cid] = $item }
                 }
                 Close-Key $ndi; Close-Key $ik
@@ -1813,21 +1851,44 @@ function New-LeftoversPlan {
             }
             $byCid = $null
             foreach ($cid in $ourNetComponents.Keys) { if ($text -match ('(?i)(?<![A-Za-z0-9_])' + [regex]::Escape($cid) + '(?![A-Za-z0-9_])')) { $byCid = $cid; break } }
-            $bySvc = $null
+            # EVERY service the package installs, not just the first of ours: one package can carry a device's
+            # function driver as well as the app's helper service (review 2026-09-29).
+            $bySvc = $null; $foreignSvc = @()
             foreach ($m in [regex]::Matches($text, '(?im)^\s*AddService\s*=\s*"?([^",\s]+)')) {
                 $svc = $m.Groups[1].Value
                 if ($svc -match '^%(.+)%$' -and $strings.ContainsKey($matches[1])) { $svc = $strings[$matches[1]] }
-                if ($ourServiceNames -contains $svc) { $bySvc = $svc; break }
+                if ($ourServiceNames -contains $svc) { if (-not $bySvc) { $bySvc = $svc } }
+                elseif ($foreignSvc -notcontains $svc) {
+                    # Someone else's only if it is actually installed: a real service definition has a
+                    # Type. An INF also names services for options never installed here; Npcap's installer
+                    # even leaves an npcap_wifi key holding nothing but Start=4 (lab 2026-09-29). Those
+                    # belong to no one, and counting them blocked Npcap's own package.
+                    $fk = Open-Key 'HKLM64' "SYSTEM\CurrentControlSet\Services\$svc"
+                    if ($fk) {
+                        $isReal = $null -ne (Get-ValueSafe $fk 'Type')
+                        Close-Key $fk
+                        if ($isReal) { $foreignSvc += $svc }
+                    }
+                }
             }
             if ($byCid -or $bySvc) {
-                if ($byCid) { $ourNetComponents[$byCid].op.inf = $inf.Name }
+                # Only fill in the component's INF when Windows didn't record one (see InfPath above).
+                if ($byCid -and -not $ourNetComponents[$byCid].op.inf) { $ourNetComponents[$byCid].op.inf = $inf.Name }
                 $key = if ($byCid) { $byCid } else { $bySvc }
                 $review = ($byCid -and $ourNetComponents[$byCid].review) -or ($bySvc -and $reviewServices.Contains($bySvc))
+                # `pnputil /delete-driver /uninstall` takes the package off every device using it. A package
+                # that also installs someone else's service, or that a device other than our own network
+                # components is using, is reported and never removed: on a storage or display driver
+                # that is a machine that won't boot or shows nothing.
+                $users = @(Get-InfDeviceUsers $inf.Name | Where-Object { $ourNetComponents.Keys -notcontains $_ })
+                $blocked = @()
+                if ($foreignSvc.Count) { $blocked += "it also installs service(s) $($foreignSvc -join ', ')" }
+                if ($users.Count) { $blocked += "device(s) use it: $(($users | Select-Object -First 3) -join ', ')" }
                 [void](Add-PlanItem -Category 'DriverPackage' -Level 3 -Target "driver package $($inf.Name)" `
-                        -Action "pnputil /delete-driver $($inf.Name) /uninstall (exported to the backup first)" `
+                        -Action $(if ($blocked.Count) { "leave it: $($blocked -join '; ')" } else { "pnputil /delete-driver $($inf.Name) /uninstall (exported to the backup first)" }) `
                         -Evidence $(if ($byCid) { "$($inf.Name) installs our network component $byCid" } else { "$($inf.Name) installs our service '$bySvc'" }) -Risk 'high' `
-                        -Review:$review -Note $(if ($review) { "needs review: '$key' is tied by vendor only" } else { $null }) `
-                        -Op ([ordered]@{ kind = 'DriverPackageDelete'; inf = $inf.Name }))
+                        -Review:($review -and -not $blocked.Count) -Note $(if ($blocked.Count) { 'not removed: ' + ($blocked -join '; ') } elseif ($review) { "needs review: '$key' is tied by vendor only" } else { $null }) `
+                        -Op $(if ($blocked.Count) { $null } else { [ordered]@{ kind = 'DriverPackageDelete'; inf = $inf.Name } }))
             }
         }
     }
@@ -3146,7 +3207,24 @@ function Invoke-PrimitiveOp {
         }
         'ServiceDelete' {
             $k = Open-Key 'HKLM64' "SYSTEM\CurrentControlSet\Services\$($Op.name)"
-            if (-not $k) { $rec.result = 'skipped'; break }
+            if (-not $k) {
+                # Already gone: `netcfg -u` deletes a network component's driver service itself, but it
+                # leaves the driver's .sys file behind (Npcap, lab 2026-09-29: npcap.sys stayed in
+                # System32\drivers after a "skipped"). Still quarantine the file; restore then puts back
+                # only the file, since this run never deleted the service.
+                $rec.serviceAbsent = $true
+                if ($Op.quarantineImage -and $Op.image -and (Test-Path -LiteralPath $Op.image -PathType Leaf) -and $script:Run.Backup) {
+                    $vol = ([string]$Op.image).Substring(0, 2)
+                    $dst = [System.IO.Path]::Combine((Get-QuarantineRoot $script:Run.RunId $vol), ([string]$Op.image).Substring(3))
+                    $state = Move-PathOrSchedule $Op.image $dst
+                    $rec.moves = @([pscustomobject]@{ src = $Op.image; dst = $dst; state = $state })
+                    $rec.result = if ($state -eq 'pending') { 'pending' } else { 'done' }
+                } elseif ($Op.quarantineImage -and $Op.image -and (Test-Path -LiteralPath $Op.image -PathType Leaf)) {
+                    try { Remove-Item -LiteralPath $Op.image -Force -ErrorAction Stop; $rec.result = 'done' }
+                    catch { if ([Leftovers.Native]::DeleteOnReboot([string]$Op.image)) { $rec.result = 'pending' } else { throw "could not delete $($Op.image) now or at the next boot" } }
+                } else { $rec.result = 'skipped' }
+                break
+            }
             $rec.startOriginal = [int](0 + (Get-ValueSafe $k 'Start')); $rec.typeOriginal = [int](0 + (Get-ValueSafe $k 'Type'))
             $rec.imageRaw = [string]($k.GetValue('ImagePath', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames))
             # What CreateService needs to bring it back as it was (the .reg backup restores the rest).
@@ -3462,7 +3540,7 @@ function Invoke-LeftoversRestore {
     $prior = @(Get-JournalRecords $restoreJournal)
     $script:Run = [pscustomobject]@{ RunId = $RunId; Root = $root; Backups = (Join-Path $root 'backups'); Journal = $restoreJournal; Seq = $(if ($prior.Count) { [int]($prior | Measure-Object -Property seq -Maximum).Maximum } else { 0 }); Backup = $false; LogFile = $(if ($meta.log) { $meta.log } else { $null }) }
     Write-RunLog "Restoring run $RunId ($($meta.app), level $($meta.level)): $($records.Count) change(s), newest first"
-    $failed = 0; $reboot = $false; $restarts = @()
+    $failed = 0; $reboot = $false; $restarts = @(); $deferred = 0; $held = 0; $chainBlocked = $false
     foreach ($r in $records) {
         # A change that failed before it backed anything up or moved anything changed nothing: there is
         # nothing to undo (counting it as a failed restore made a clean restore exit 1).
@@ -3470,11 +3548,35 @@ function Invoke-LeftoversRestore {
             Add-JournalRecord @{ itemId = $r.itemId; category = $r.category; kind = "Undo-$($r.kind)"; undoOf = $r.seq; op = $null; result = 'done'; note = 'nothing had changed' }
             continue
         }
+        # Logon hooks, device filters, services, network components and drivers (order 300-349) depend on
+        # each other and on the app's files. Once anything they could rest on has failed, none of them goes
+        # back: a filter or a driver service put back without its file kills a device class at boot.
+        $order = [int]$script:Order[[string]$r.category]
+        $isChain = $order -ge 300 -and $order -lt 350
+        if ($isChain -and $chainBlocked) { $held++; continue }
+        # A signed-in user's key is restored into their loaded hive. Once they have signed out it isn't
+        # there to restore into: defer it (a rerun while they are signed in finishes it) rather than fail,
+        # and never let it hold up the machine-wide changes (review 2026-09-29).
+        $sid = if ((Get-Prop $r 'op') -and [string](Get-Prop $r.op 'hive') -eq 'HKU') { ([string]$r.op.path -split '\\')[0] } else { $null }
+        if ($sid) {
+            $hk = $null
+            try { $hk = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::Users, [Microsoft.Win32.RegistryView]::Default).OpenSubKey($sid, $false) } catch { }
+            if ($null -eq $hk) {
+                $deferred++
+                Add-JournalRecord @{ itemId = $r.itemId; category = $r.category; kind = "Undo-$($r.kind)"; undoOf = $r.seq; op = $null; result = 'deferred'; note = "user $sid is not signed in" }
+                Write-RunLog ("  deferred [{0}] {1}: user {2} is not signed in; run -Restore {3} again while they are" -f $r.category, $r.kind, $sid, $RunId)
+                continue
+            }
+            $hk.Close()
+        }
         try {
             switch ($r.kind) {
                 { $_ -in @('RegDeleteKey', 'RegDeleteValue', 'RegRemoveMultiSzEntry', 'RegRemoveListEntry', 'RegSetValue', 'MsiComponentClients') } {
                     if (-not $r.backup) { throw 'no backup recorded' }
                     Invoke-RegImport $r.backup
+                    # A filter entry put back only joins the device stack when the stack is rebuilt: at boot.
+                    # Reporting "complete" here left the filter inactive with no word of it (review 2026-09-29).
+                    if ([string]$r.category -in @('DeviceClassFilter', 'DeviceInstanceFilter')) { $reboot = $true }
                     if ($r.kind -eq 'RegSetValue' -and (Get-Prop $r 'valueExisted') -eq $false) {
                         # The value did not exist before: the backup holds only its key, so take it out again.
                         $k = Open-Key $r.op.hive $r.op.path -Writable
@@ -3517,6 +3619,9 @@ function Invoke-LeftoversRestore {
                         if ((Test-Path -LiteralPath $m.dst) -and -not (Test-Path -LiteralPath $m.src)) { [System.IO.File]::Move($m.dst, $m.src) }
                         elseif ($m.state -eq 'pending') { Clear-PendingMove $m.src }
                     }
+                    # The run only moved the file (something else had already removed the service): the
+                    # file is back, and whatever removed the service puts it back (netcfg -l, restored below).
+                    if (Get-Prop $r 'serviceAbsent') { break }
                     $name = [string]$r.op.name
                     if ((Invoke-ScExe @('query', $name)).Code -eq 1060) {
                         $deps = @(Get-Prop $r 'dependOnService' | Where-Object { $_ })
@@ -3544,11 +3649,15 @@ function Invoke-LeftoversRestore {
                     # through it too (a partial run had already set this service to disabled).
                     $startWord = switch ([int](Get-Prop $r 'startOriginal')) { 0 { 'boot' } 1 { 'system' } 2 { 'auto' } 4 { 'disabled' } default { 'demand' } }
                     [void](Invoke-ScExe @('config', $name, 'start=', $startWord))
+                    $started = $false
                     if (Get-Prop $r 'wasRunning') {
                         $st = Invoke-ScExe @('start', $name)
-                        if ($st.Code -notin @(0, 1056)) { Write-RunLog "  service $name is back but did not start (sc start: $($st.Code)); start it once whatever it needs is back" }
+                        $started = $st.Code -in @(0, 1056)
+                        if (-not $started) { Write-RunLog "  service $name is back but did not start (sc start: $($st.Code)); start it once whatever it needs is back" }
                     }
-                    if ([int](Get-Prop $r 'startOriginal') -le 1 -and $r.op.isDriver) { $reboot = $true }
+                    # A driver that is back but not running (boot/system start, or a filter that only loads
+                    # into a stack at boot) needs the reboot to be in effect.
+                    if ($r.op.isDriver -and -not $started) { $reboot = $true }
                 }
                 'NetcfgUninstall' {
                     $inf = @(Get-ChildItem -LiteralPath $r.backup -Recurse -Filter *.inf -ErrorAction Stop | Select-Object -First 1)
@@ -3584,25 +3693,56 @@ function Invoke-LeftoversRestore {
             Add-JournalRecord @{ itemId = $r.itemId; category = $r.category; kind = "Undo-$($r.kind)"; undoOf = $r.seq; op = $null; result = 'done' }
             Write-RunLog ("  restored [{0}] {1}" -f $r.category, $r.kind)
         } catch {
-            # STOP here. Newest-first IS the dependency order: carrying on would put back older changes
-            # that rest on this one, such as a device filter for a driver that isn't back (every device in
-            # the class dead at the next boot), or a credential provider while the password sign-in is off
-            # again (review 2026-09-26). Undone records are skipped next time, so a rerun resumes here.
+            # Newest-first IS the dependency order inside the chain: carrying on past a failed chain change
+            # would put back older ones that rest on it, such as a device filter for a driver that isn't back
+            # (every device in the class dead at the next boot), or a credential provider while the password
+            # sign-in is off again (review 2026-09-26). So a chain failure stops the restore.
+            # Outside the chain it does NOT (review 2026-09-29): one missing quarantined file used to stop
+            # every older change from coming back, on every rerun, forever. Those carry on; only a failure
+            # the chain could rest on (the app's files) holds the chain back. Undone records are skipped
+            # next time, so a rerun picks up whatever is left.
             $failed++
             Add-JournalRecord @{ itemId = $r.itemId; category = $r.category; kind = "Undo-$($r.kind)"; undoOf = $r.seq; op = $null; result = 'failed'; note = $_.Exception.Message }
             Write-RunLog ("  FAILED to restore [{0}] {1}: {2}" -f $r.category, $r.kind, $_.Exception.Message)
-            Write-RunLog "  Restore stopped here: nothing older was put back, because it may depend on this. Fix the cause$(if ($reboot) { ' (reboot first)' }), then run -Restore $RunId again."
-            break
+            if ($isChain) {
+                Write-RunLog "  Restore stopped here: nothing older was put back, because it may depend on this. Fix the cause$(if ($reboot) { ' (reboot first)' }), then run -Restore $RunId again."
+                break
+            }
+            if ((Get-CategoryGroup ([string]$r.category)) -eq 'Files') { $chainBlocked = $true }
         }
     }
+    if ($held) { Write-RunLog "  $held logon hook, driver or service change(s) held back: they may depend on what failed above. Fix it, then run -Restore $RunId again." }
     foreach ($s in $restarts | Select-Object -Unique) { try { Restart-Service -Name $s -Force -ErrorAction Stop } catch { } }
-    $meta.status = if ($failed) { 'restore-partial' } else { 'restored' }
+    $incomplete = $failed -or $deferred -or $held
+    $meta.status = if ($incomplete) { 'restore-partial' } else { 'restored' }
     ($meta | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $metaFile -Encoding UTF8
-    Write-RunLog "Restore of $RunId $(if ($failed) { 'stopped part way' } else { 'complete' })$(if ($reboot) { '; reboot to finish' })."
-    if ($failed -and $reboot) { return 3010 }
-    if ($failed) { return 1 }
+    Write-RunLog "Restore of $RunId $(if ($incomplete) { 'is not finished' } else { 'complete' })$(if ($reboot) { '; reboot to finish' })."
+    # An unfinished restore is exit 1 even when it also needs a reboot. It used to return 3010, which an
+    # RMM reads as success and the window read as "reboot, then Resume", and -Resume refuses a restored
+    # run: the rest never came back (review 2026-09-29). The way on is always -Restore again.
+    if ($incomplete) {
+        Write-RunLog "  To finish: $(if ($reboot) { 'reboot, then ' })run -Restore $RunId again."
+        return 1
+    }
     if ($reboot) { return 3010 }
     return 0
+}
+
+function Test-NetComponentPresent {
+    # Is a network service/protocol/client with this ComponentId still installed?
+    param([string] $ComponentId)
+    foreach ($g in @('{4D36E974-E325-11CE-BFC1-08002BE10318}', '{4D36E975-E325-11CE-BFC1-08002BE10318}', '{4D36E973-E325-11CE-BFC1-08002BE10318}')) {
+        $nk = Open-Key 'HKLM64' "SYSTEM\CurrentControlSet\Control\Network\$g"
+        try {
+            foreach ($inst in (Get-SubKeyNamesSafe $nk 'network components')) {
+                $ik = $null; try { $ik = $nk.OpenSubKey($inst, $false) } catch { continue }
+                if ($null -eq $ik) { continue }
+                $cid = [string](Get-ValueSafe $ik 'ComponentId'); Close-Key $ik
+                if ($cid -and $cid -ieq $ComponentId) { return $true }
+            }
+        } finally { Close-Key $nk }
+    }
+    return $false
 }
 
 function Invoke-LeftoversResume {
@@ -3641,6 +3781,19 @@ function Invoke-LeftoversResume {
             $ok = $false
             if ($bootedSince) { $lost += "service $($r.op.name)" }
         }
+        # Network components and driver packages have nothing in the move list to check, so they used to be
+        # marked done unchecked, even by a -Resume with no reboot at all (review 2026-09-29). Check the
+        # thing itself: the component gone from the network class, the INF gone from %SystemRoot%\INF.
+        if ($r.kind -eq 'NetcfgUninstall' -and (Test-NetComponentPresent ([string]$r.op.componentId))) {
+            $ok = $false
+            if ($bootedSince) { $lost += "network component $($r.op.componentId)" }
+        }
+        if ($r.kind -eq 'DriverPackageDelete' -and (Test-Path -LiteralPath (Join-Path $env:SystemRoot "INF\$($r.op.inf)"))) {
+            $ok = $false
+            if ($bootedSince) { $lost += "driver package $($r.op.inf)" }
+        }
+        # Anything else with no check of its own: only a boot since the run can have finished it.
+        if ($ok -and -not $bootedSince -and $r.kind -notin @('ServiceDelete', 'NetcfgUninstall', 'DriverPackageDelete') -and -not @(Get-Prop $r 'moves' | Where-Object { $_ }).Count) { $ok = $false }
         if (-not $ok -and $lost.Count) {
             $leftInPlace++
             foreach ($x in $lost) { Write-RunLog "  left in place: $x (a boot has passed and the change is no longer queued; it did not happen)" }
@@ -3847,7 +4000,7 @@ function New-LeftoversForm {
         $present = @(Get-GuiGroups $ui.Plan $lvl | ForEach-Object { $_.Group })
         $exclude = @($present | Where-Object { $ui.Unchecked.ContainsKey($_) })
         $appName = if ($ui.App) { $ui.App.DisplayName } elseif ($ui.Plan) { $ui.Plan.target.displayName } else { '<app>' }
-        $pcode = if ($ui.App -and $ui.App.ProductCode) { $ui.App.ProductCode } elseif (-not $ui.App -and $ui.Plan -and $ui.Plan.target.productCode) { $ui.Plan.target.productCode } else { $null }
+        $pcode = if ($ui.App -and $ui.App.ProductCode -and $ui.App.IsMsi) { $ui.App.ProductCode } elseif (-not $ui.App -and $ui.Plan -and $ui.Plan.target.productCode -and (Get-Prop $ui.Plan.target 'isMsi')) { $ui.Plan.target.productCode } else { $null }
         $ui.Command.Text = Format-CommandLine -AppName $appName -ProductCode $pcode -Level $lvl -Exclude $exclude -IncludeUserData $ui.UserData.Checked -IncludeReview $ui.Review.Checked `
             -NoBackup (-not $ui.Backup.Checked) -NoLog (-not $ui.LogCheck.Checked) -LogPath $ui.LogPath.Text -SkipUninstall (-not $ui.Uninstall.Checked)
         $ui.Uninstall.Enabled = ($lvl -ge 1)
@@ -3993,7 +4146,13 @@ function Show-LeftoversGui {
             if ($code -eq 0 -and (Test-Path -LiteralPath $pf)) { $ui.PlanFile = $pf; & $ui.LoadPlan (Get-Content -LiteralPath $pf -Raw -Encoding UTF8 | ConvertFrom-Json) }
             else { $ui.Status.Text = "Scan stopped (exit $code)."; Show-TextDialog 'Leftovers: scan' $output $ui.Form }
         } else {
-            $meaning = switch ($code) { 0 { 'done' } 3010 { 'done; reboot, then Resume' } 1 { 'stopped part way; the run can be restored' } 2 { 'refused' } default { 'stopped on an error' } }
+            # By kind: a restore's 3010 means "reboot and it's in effect" and its 1 means "not finished, run
+            # Restore again"; only a cleanup's 3010 goes on to Resume (review 2026-09-29).
+            $meaning = if ($state.Kind -eq 'Restore') {
+                switch ($code) { 0 { 'done' } 3010 { 'done; reboot to finish' } 1 { 'not finished; see why, then Restore again' } 2 { 'refused' } default { 'stopped on an error' } }
+            } else {
+                switch ($code) { 0 { 'done' } 3010 { 'done; reboot, then Resume' } 1 { 'stopped part way; the run can be restored' } 2 { 'refused' } default { 'stopped on an error' } }
+            }
             $ui.Status.Text = "$($state.Kind) finished: exit $code ($meaning)."
             Show-TextDialog "Leftovers: $($state.Kind) (exit $code, $meaning)" $output $ui.Form
             if ($state.Kind -ne 'Restore') { $ui.Plan = $null; $ui.PlanFile = $null; & $ui.Rebuild }

@@ -37,9 +37,12 @@ didn't happen: another reboot won't help then). Level 3 also stops the app's own
 from its folder; a restore doesn't restart them.
 
 `-Restore <runId>` undoes a run newest change first. If one change can't be undone (something new sits
-where a file was, a service still waits on a reboot), the restore stops right there and puts nothing
-older back, because older changes can depend on it. Fix the cause, run `-Restore` again, and it
-carries on from where it stopped.
+where a file was, a service still waits on a reboot), the rest still comes back, except the logon
+hooks, device filters, services, network components and drivers: those can depend on what failed, so
+a failure among them stops the restore, and a failed file holds them back. A signed-in user's settings
+are restored while that user is signed in; if they've signed out since, those wait. Either way the
+restore exits 1 and says why. Fix the cause (or reboot, or have the user sign in), run `-Restore`
+again, and it carries on with whatever is left.
 
 ## Run it
 
@@ -83,8 +86,8 @@ quarantine for drive C:; other drives keep theirs in `<drive>:\.leftovers\<runId
 | Exit code | Meaning |
 |---|---|
 | 0 | done (or plan written) |
-| 3010 | done, but a reboot is needed to finish (then `-Resume`) |
-| 1 | stopped part way: the item that failed is in the report; `-Restore` undoes the rest |
+| 3010 | done, but a reboot is needed to finish (after a run: then `-Resume`; after a restore: that's all) |
+| 1 | stopped part way: the item that failed is in the report; `-Restore` undoes the rest. After a restore: not finished, run `-Restore` again |
 | 2 | refused: policy, a protected product, an ambiguous name, or no confirmation |
 | 3 | bad input, app not found, or not elevated |
 | 4 | stopped on an unexpected error |

@@ -285,7 +285,7 @@ Assert-Equal '7' (& $ids (Select-PlanItems $testPlan 3 @('UserData') @() $false 
 
 # ---- profiles: the shipped ones load, a malformed one is refused, the registry fence holds
 $profs = @(Import-AppProfile)
-Assert-Equal 'Notepad++,PuTTY' ((@($profs | ForEach-Object { $_.Data.Name }) | Sort-Object) -join ',') 'shipped profiles load (the .example template does not)'
+Assert-Equal 'Citrix Workspace,Notepad++,PuTTY,Zoom' ((@($profs | ForEach-Object { $_.Data.Name }) | Sort-Object) -join ',') 'shipped profiles load (the .example template does not)'
 $badDir = Join-Path ([System.IO.Path]::GetTempPath()) ('leftovers-prof-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path $badDir -Force | Out-Null
 try {
