@@ -180,6 +180,14 @@ Assert-Equal $true ([bool](Resolve-RunLevel -Level 1 -KillIt $true -SkipUninstal
 Assert-Equal $true ([bool](Resolve-RunLevel -Level 2 -KillIt $true -SkipUninstall $false).Error) '-KillIt with -Level 2 is refused'
 $r = Resolve-RunLevel -Level 2 -KillIt $false -SkipUninstall $true
 Assert-Equal '2|True' "$($r.Level)|$($r.SkipUninstall)" 'without -KillIt the level and switch pass through'
+# Every result carries every key: the script runs under Set-StrictMode, where reading a key a hashtable
+# lacks THROWS. A success result without Error crashed every run in the first catalog pilot (2026-10-03),
+# and New-UninstallCommand exists for the same reason. Checked on every shape each function returns.
+foreach ($case in @(@(0, $false, $false), @(0, $true, $false), @(3, $true, $false), @(1, $true, $false))) {
+    $r = Resolve-RunLevel -Level $case[0] -KillIt $case[1] -SkipUninstall $case[2]
+    Assert-Equal 'Error,Level,SkipUninstall' ((@($r.Keys) | Sort-Object) -join ',') "Resolve-RunLevel $($case -join '/'): every key present"
+}
+Assert-Equal 'Args,Exe,Fail,How,Skip' ((@((New-UninstallCommand -Skip 'x').Keys) | Sort-Object) -join ',') 'New-UninstallCommand: every key present'
 
 # ---- level 1: which engine built an uninstaller, and the silent command for it
 $fp = Join-Path ([System.IO.Path]::GetTempPath()) ('killitwithfire-fp-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -195,7 +203,7 @@ try {
     Assert-Equal 'Unknown' (Get-InstallerEngine (Join-Path $fp 'tiny.exe')) 'engine: a file under 64 bytes is Unknown'
     Assert-Equal 'Unknown' (Get-InstallerEngine (Join-Path $fp 'missing.exe')) 'engine: a missing file is Unknown, not an error'
 
-    $t = { param([hashtable] $h) $o = [ordered]@{ isMsi = $false; productCode = $null; uninstallString = $null; quietUninstallString = $null; installLocation = $null; entrySid = $null }; foreach ($k in $h.Keys) { $o[$k] = $h[$k] }; [pscustomobject]$o }
+    $t = { param([hashtable] $h) $o = [ordered]@{ displayName = 'Some App'; isMsi = $false; productCode = $null; uninstallString = $null; quietUninstallString = $null; installLocation = $null; entrySid = $null }; foreach ($k in $h.Keys) { $o[$k] = $h[$k] }; [pscustomobject]$o }
     $c = Get-UninstallCommand (& $t @{ isMsi = $true; productCode = '{DDC95F26-92B1-4546-9678-5DC68DF76BA0}' })
     Assert-Equal '/x {DDC95F26-92B1-4546-9678-5DC68DF76BA0} /qn /norestart' $c.Args 'MSI: msiexec /x, quiet'
     $c = Get-UninstallCommand (& $t @{ uninstallString = 'MsiExec.exe /I{DDC95F26-92B1-4546-9678-5DC68DF76BA0}' })
@@ -225,6 +233,21 @@ try {
     Assert-Equal $true ([bool]$c.Fail -and -not $c.Exe) 'a deleted uninstaller fails without running anything'
     $c = Get-UninstallCommand (& $t @{ uninstallString = "`"$nsis`""; entrySid = 'S-1-5-21-1-2-3-9999' })
     Assert-Equal $true ([bool]$c.Skip -and $c.Skip -like '*per-user*') 'another user''s per-user entry: its uninstaller is not run as us'
+    # The agent's per-product rules, checked before the engine markers, on an UninstallString only.
+    $any = & $stub 'AnyDesk.exe' 'nothing'
+    $c = Get-UninstallCommand (& $t @{ displayName = 'AnyDesk'; uninstallString = "`"$any`" --uninstall" })
+    Assert-Equal '--silent --remove' $c.Args 'named rule: AnyDesk is replaced (its --uninstall prompts)'
+    $ctx = & $stub 'bootstrapperhelper.exe' 'nothing'
+    $c = Get-UninstallCommand (& $t @{ displayName = 'Citrix Workspace 2409'; uninstallString = "`"$ctx`" /uninstall /cleanup" })
+    Assert-Equal '/silent /uninstall /cleanup' $c.Args 'named rule: Citrix gets /silent first'
+    $gd = & $stub 'uninstall.exe' 'nothing'
+    $c = Get-UninstallCommand (& $t @{ displayName = 'Google Drive'; uninstallString = "`"$gd`"" })
+    Assert-Equal '--silent --force_stop' $c.Args 'named rule: Google Drive (a bare uninstall exits 0 while it runs)'
+    $sq = & $stub 'Update.exe' 'nothing'
+    $c = Get-UninstallCommand (& $t @{ displayName = 'Discord'; uninstallString = "`"$sq`" --uninstall" })
+    Assert-Equal '--uninstall -s' $c.Args 'Squirrel: Update.exe --uninstall gets -s'
+    $c = Get-UninstallCommand (& $t @{ displayName = 'AnyDesk'; quietUninstallString = "`"$any`" --remove --silent"; uninstallString = "`"$any`" --uninstall" })
+    Assert-Equal '--remove --silent' $c.Args 'a vendor QuietUninstallString wins over a named rule'
     $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $c = Get-UninstallCommand (& $t @{ uninstallString = "`"$nsis`""; entrySid = $me })
     Assert-Equal "/S _?=$fp" $c.Args 'our own per-user entry: its uninstaller runs'

@@ -676,10 +676,12 @@ function Resolve-RunLevel {
     # -KillIt is a level 3 run with -SkipUninstall, and nothing more: the caller applies the policy, the
     # refusals and the backup to the RESULT, so -KillIt can never reach what that pair could not. Level 0 is
     # the parameter's default, so it reads as "not given"; 1 and 2 contradict -KillIt and are refused.
+    # EVERY key on every return: under Set-StrictMode a caller reading .Error on a result that lacks it
+    # throws, which crashed every run (scans included) in the first catalog pilot, 2026-10-03.
     param([int] $Level, [bool] $KillIt, [bool] $SkipUninstall)
-    if (-not $KillIt) { return @{ Level = $Level; SkipUninstall = $SkipUninstall } }
-    if ($Level -ne 0 -and $Level -ne 3) { return @{ Error = "-KillIt is a level 3 run; leave -Level $Level out." } }
-    return @{ Level = 3; SkipUninstall = $true }
+    if (-not $KillIt) { return @{ Level = $Level; SkipUninstall = $SkipUninstall; Error = $null } }
+    if ($Level -ne 0 -and $Level -ne 3) { return @{ Level = $Level; SkipUninstall = $SkipUninstall; Error = "-KillIt is a level 3 run; leave -Level $Level out." } }
+    return @{ Level = 3; SkipUninstall = $true; Error = $null }
 }
 
 function Get-PolicyViolations {
@@ -3402,9 +3404,25 @@ $script:InstallerEngineMarkers = @(
     @('InnoSetup', 'Inno Setup Setup Data'), @('InnoSetup', 'JR.Inno.Setup'),
     @('InstallShield', 'InstallShield'), @('InstallAware', 'InstallAware'))
 $script:EngineUninstallArgs = @{
-    Nsis = '/S'; InnoSetup = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART'; WixBurn = '/uninstall /quiet /norestart'
-    InstallShield = '-s'; InstallAware = '/s'
+    Nsis = '/S'; InstallShield = '-s'; InstallAware = '/s'
+    InnoSetup = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART'; WixBurn = '/uninstall /quiet /norestart'
 }
+# Per-product rules, a PORT of the agent's SilentRules table (DeployOrchestrator.cs), each one measured on
+# a real machine there. Checked before the engine markers, as the agent does, and only against an
+# UninstallString: a vendor's own QuietUninstallString is trusted as written. Keep the two in step.
+# (The agent's Visual Studio rule is left out: Microsoft software is refused before level 1 runs.)
+$script:NamedUninstallRules = @(
+    # Citrix: "bootstrapperhelper.exe /uninstall /cleanup" prompts; /silent first silences it.
+    @{ Name = 'Citrix Workspace'; Inject = '/silent' },
+    @{ Name = 'Citrix Receiver'; Inject = '/silent' },
+    # AnyDesk: "AnyDesk.exe --uninstall" prompts; this replaces it.
+    @{ Name = 'AnyDesk'; Override = '--silent --remove' },
+    # Google Drive: a bare uninstall.exe exits 0 WITHOUT uninstalling while GoogleDriveFS.exe runs.
+    @{ Name = 'Google Drive'; Override = '--silent --force_stop' },
+    # NOT from the agent's table: Squirrel.Windows apps (Discord, Slack, GitHub Desktop) uninstall through
+    # "Update.exe --uninstall", which prompts nothing but shows progress; -s is Squirrel's silent switch.
+    @{ ExeName = 'Update.exe'; ArgsMatch = '(?i)--uninstall\b'; Append = '-s' }
+)
 
 function Get-InstallerEngine {
     # 'Nsis', 'InnoSetup', 'WixBurn', 'InstallShield', 'InstallAware' or 'Unknown'. Never throws: an
@@ -3463,6 +3481,21 @@ function Get-UninstallCommand {
         return (New-UninstallCommand -Skip "an msiexec $from with no ProductCode in it: $args0")
     }
     if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { return (New-UninstallCommand -Fail "$exe does not exist (the uninstaller is gone, so the scrub does the work)") }
+    if ($from -eq 'UninstallString') {
+        foreach ($r in $script:NamedUninstallRules) {
+            if ($r.ContainsKey('Name') -and ([string]$Target.displayName).IndexOf($r.Name, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+            if ($r.ContainsKey('ExeName') -and -not (Split-Path $exe -Leaf).Equals($r.ExeName, [StringComparison]::OrdinalIgnoreCase)) { continue }
+            if ($r.ContainsKey('ArgsMatch') -and $args0 -notmatch $r.ArgsMatch) { continue }
+            $label = $(if ($r.ContainsKey('Name')) { $r.Name } else { $r.ExeName })
+            if ($r.ContainsKey('Override')) { return (New-UninstallCommand -Exe $exe -Arguments $r.Override -How "named rule: $label") }
+            if ($r.ContainsKey('Inject')) { return (New-UninstallCommand -Exe $exe -Arguments ("$($r.Inject) $args0").Trim() -How "named rule: $label") }
+            if ($r.ContainsKey('Append')) {
+                $a = $args0
+                if ($a -notmatch ('(^|\s)' + [regex]::Escape($r.Append) + '(\s|$)')) { $a = ("$a $($r.Append)").Trim() }
+                return (New-UninstallCommand -Exe $exe -Arguments $a -How "named rule: $label")
+            }
+        }
+    }
     $engine = Get-InstallerEngine $exe
     if ($engine -eq 'Nsis') {
         # A bare NSIS uninstaller copies itself to %TEMP%, relaunches DETACHED and exits 0 at once, so the
