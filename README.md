@@ -1,21 +1,34 @@
-# Leftovers
+# Kill It With Fire
 
-<!-- BRIAN: the opening warning goes here, in your words. The beat: this is for an app whose uninstall is
-     ALREADY broken. If msiexec /x or the vendor's uninstaller still works, use that. Leftovers is the
-     second attempt, not the first. -->
+<!-- BRIAN: the opening warning goes here, in your words. The beats (2026-10-03): it removes ANY app, live
+     or broken. The proper way is the default: the app's own uninstaller first, then whatever it left
+     behind. KILL IT skips the uninstaller and scrubs the app out. Either way it scans first, backs
+     everything up, and Restore puts it back; it never touches Microsoft software, security agents or
+     Windows itself. -->
 
-Cleans up what a broken Windows app left behind: registration, services, drivers, device filters,
-network components, driver packages, scheduled tasks, startup entries, COM, shell extensions, file
-associations, logon hooks, firewall rules, shortcuts, folders and per-user state. Every item comes with
-the evidence that ties it to the app, everything it changes is backed up first, and a whole run can be
-restored.
+Removes a Windows app completely, the proper way or the hard way:
+
+- **The proper way** (the default): the app's own uninstaller runs first, silently, and then whatever it
+  left behind is cleaned up. For an MSI that is `msiexec /x`. For an EXE it is the app's registered quiet
+  uninstall command, or the silent switch of the engine that built its uninstaller (NSIS, Inno Setup,
+  WiX Burn, InstallShield, InstallAware), recognised from markers inside the uninstaller itself. An
+  uninstaller with no known silent switch is skipped rather than left waiting for a click.
+- **KILL IT** (`-KillIt`, or the KILL IT box in the window): skip the uninstaller and scrub the app out.
+  For an uninstaller that is broken, hangs, or wants a click nobody is there to give.
+
+What gets cleaned up: registration, services, drivers, device filters, network components, driver
+packages, scheduled tasks, startup entries, COM, shell extensions, file associations, logon hooks,
+firewall rules, shortcuts, folders and per-user state. Every item comes with the evidence that ties it
+to the app, everything it changes is backed up first, and a whole run can be restored. (A restore puts
+back what Kill It With Fire removed. After the proper way, the app's own uninstaller has already done
+most of the work, so reinstall the app instead.)
 
 ## Levels
 
 | Level | What it does |
 |---|---|
 | 0 | **Scan only.** Writes `plan.json` and `report.txt`. Changes nothing. The default. |
-| 1 | **Uninstall.** Runs the app's own uninstaller once, silently (`msiexec /x` or its QuietUninstallString). |
+| 1 | **Uninstall.** Runs the app's own uninstaller once, silently (above). `-KillIt` skips it. |
 | 2 | **Registration cleanup.** Removes the uninstall entry and the Windows Installer registration so the app can install again. Files are not touched. |
 | 3 | **Full scrub.** Unhooks the app from Windows, then moves its files to a quarantine on the same drive. |
 
@@ -50,14 +63,15 @@ Elevated (admin or SYSTEM), Windows PowerShell 5.1 or PowerShell 7, 64-bit (a 32
 itself in 64-bit PowerShell).
 
 ```powershell
-.\Leftovers.ps1                                         # the window (below)
-.\Leftovers.ps1 -List                                   # installed apps, to pick a target
-.\Leftovers.ps1 -Name "Notepad++ (64-bit x64)"          # scan: the plan and the evidence
-.\Leftovers.ps1 -ProductCode "{DDC95F26-92B1-4546-9678-5DC68DF76BA0}" -Level 2 -Force
-.\Leftovers.ps1 -Name "Notepad++ (64-bit x64)" -Level 3 -Exclude Drivers -Force
-.\Leftovers.ps1 -ListRuns
-.\Leftovers.ps1 -Restore 20260926-093000-1a2b3c -Force
-.\Leftovers.ps1 -Resume 20260926-093000-1a2b3c
+.\KillItWithFire.ps1                                         # the window (below)
+.\KillItWithFire.ps1 -List                                   # installed apps, to pick a target
+.\KillItWithFire.ps1 -Name "Notepad++ (64-bit x64)"          # scan: the plan and the evidence
+.\KillItWithFire.ps1 -ProductCode "{DDC95F26-92B1-4546-9678-5DC68DF76BA0}" -Level 2 -Force
+.\KillItWithFire.ps1 -Name "Notepad++ (64-bit x64)" -Level 3 -Exclude Drivers -Force   # the proper way
+.\KillItWithFire.ps1 -Name "Notepad++ (64-bit x64)" -KillIt -Force                      # the hard way
+.\KillItWithFire.ps1 -ListRuns
+.\KillItWithFire.ps1 -Restore 20260926-093000-1a2b3c -Force
+.\KillItWithFire.ps1 -Resume 20260926-093000-1a2b3c
 ```
 
 Without `-Force`, a run at level 1 or above prints the plan and asks you to type YES. `-Force` is for
@@ -69,7 +83,8 @@ unattended runs (RMM, PDQ, Intune).
 | `-Include` / `-Exclude` | Categories: `Registration`, `LogonHooks`, `Drivers`, `Services`, `Startup`, `ComShell`, `Other`, `Files`, `Registry`, `UserData`. |
 | `-IncludeUserData` | Also move per-user AppData folders and settings. Off by default. |
 | `-IncludeReview` | Also act on items tied only by vendor name, signer, or one MSI claim on a Windows file. Off by default. |
-| `-SkipUninstall` | Go straight to the cleanup at level 1 and up. |
+| `-KillIt` | The hard way: skip the app's own uninstaller and scrub it out (level 3). Still backed up and restorable. |
+| `-SkipUninstall` | Go straight to the cleanup at level 2 (registration only) or 3. |
 | `-NoBackup` | Change things without a backup (then the run can't be restored). |
 | `-Log <file or folder>` / `-NoLog` | Where the log goes. Default: `log.txt` in the run folder. |
 | `-Keyword <word>` | The app's own distinctive name, if the derived one is refused. |
@@ -78,10 +93,10 @@ unattended runs (RMM, PDQ, Intune).
 | `-QuarantineDays <n>` | How long run backups are kept (default 14). |
 | `-OutDir <folder>` | Where a scan writes `plan.json` and `report.txt`. |
 
-Every run gets a folder under `%ProgramData%\Leftovers\runs\<runId>\`, readable by SYSTEM and
+Every run gets a folder under `%ProgramData%\KillItWithFire\runs\<runId>\`, readable by SYSTEM and
 Administrators only: `run.json`, the plan and report, `journal.jsonl` (every change, in order),
 `backups\` (`.reg` exports), `tasks\`, `drivers\` (exported driver packages) and `files\` (the
-quarantine for drive C:; other drives keep theirs in `<drive>:\.leftovers\<runId>`).
+quarantine for drive C:; other drives keep theirs in `<drive>:\.killitwithfire\<runId>`).
 
 | Exit code | Meaning |
 |---|---|
@@ -94,15 +109,16 @@ quarantine for drive C:; other drives keep theirs in `<drive>:\.leftovers\<runId
 
 ## The window
 
-`.\Leftovers.ps1` with no arguments opens a Disk Cleanup-style window: pick the app, Scan, choose how
+`.\KillItWithFire.ps1` with no arguments opens a Disk Cleanup-style window: pick the app, Scan, choose how
 far to go, untick categories (each shows its item count and size, and a description), choose the
-options, Clean up. Restore lists earlier runs. The window shows the equivalent command line for every
+options, Clean up. Tick **KILL IT** and the level jumps to Full scrub, the uninstaller is skipped, and the
+button says "Kill it". Restore lists earlier runs. The window shows the equivalent command line for every
 choice, and it does nothing the command line can't: every action runs the same script as a child
 process with those switches.
 
 ## Locking options (Group Policy, Intune)
 
-Values under `HKLM\SOFTWARE\Policies\Leftovers`. The engine enforces them (a switch past the policy is
+Values under `HKLM\SOFTWARE\Policies\KillItWithFire`. The engine enforces them (a switch past the policy is
 refused with exit code 2); the window shows them greyed out and labelled.
 
 | Value | Type | Effect |

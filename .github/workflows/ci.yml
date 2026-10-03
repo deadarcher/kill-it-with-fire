@@ -31,7 +31,7 @@ jobs:
         run: |
           Set-PSRepository PSGallery -InstallationPolicy Trusted
           Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force
-          $r = @(Invoke-ScriptAnalyzer -Path ./Leftovers.ps1 -Severity Error, Warning)
+          $r = @(Invoke-ScriptAnalyzer -Path ./KillItWithFire.ps1 -Severity Error, Warning)
           $r | Format-Table Line, RuleName, Message -AutoSize | Out-String -Width 220 | Write-Host
           if ($r.Count) { exit 1 }
 

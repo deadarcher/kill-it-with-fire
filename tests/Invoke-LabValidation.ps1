@@ -1,10 +1,10 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Destructive end-to-end validation of Leftovers. THROWAWAY MACHINES ONLY (a lab VM or a CI runner).
+    Destructive end-to-end validation of Kill It With Fire. THROWAWAY MACHINES ONLY (a lab VM or a CI runner).
 
 .DESCRIPTION
-    Installs real apps, breaks them the way broken uninstalls really look, runs Leftovers at every level,
+    Installs real apps, breaks them the way broken uninstalls really look, runs Kill It With Fire at every level,
     and checks every change AND every restore on the machine itself. It edits HKLM, creates services
     and a device class filter, and turns the password sign-in off and on. Never run it on a machine
     you care about: it refuses to start without -ConfirmThrowaway.
@@ -17,7 +17,7 @@
                  types, shortcut, task, Run, firewall, service): all found, removed, restored exactly
       restorestop  a restore that can't undo one change stops there; a rerun finishes once the cause is gone
       plan       the window's path: -Plan <file> -Exclude ...; plan guards (other computer, stale plan)
-      policy     HKLM\SOFTWARE\Policies\Leftovers locks enforced by the engine (and shown by the window)
+      policy     HKLM\SOFTWARE\Policies\KillItWithFire locks enforced by the engine (and shown by the window)
       refusal    the RFF agent, a Microsoft MSI by ProductCode, a security vendor, a Windows keyword
       bitness    a 32-bit PowerShell host relaunches 64-bit and finds the same plan
       pending    a locked file: exit 3010, then restore BEFORE the reboot (CI-safe)
@@ -46,14 +46,14 @@ param(
     [string] $Phase = 'run',
     [string] $Engine,
     [string] $Media,
-    [string] $StateDir = (Join-Path $env:ProgramData 'LeftoversLab'),
+    [string] $StateDir = (Join-Path $env:ProgramData 'KillItWithFireLab'),
     [string] $HostExe = (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'),
     [switch] $ConfirmThrowaway
 )
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 # Not parameter defaults: Windows PowerShell 5.1 leaves $PSScriptRoot empty while defaults are evaluated.
-if (-not $Engine) { $Engine = Join-Path $PSScriptRoot '..\Leftovers.ps1' }
+if (-not $Engine) { $Engine = Join-Path $PSScriptRoot '..\KillItWithFire.ps1' }
 if (-not $Media) { $Media = Join-Path $PSScriptRoot '..\lab-media' }
 if (-not $ConfirmThrowaway) {
     Write-Host 'Refusing: this validation installs, breaks and removes software, edits HKLM, adds a device filter and turns the password sign-in off. Run it only on a throwaway lab VM or CI runner, with -ConfirmThrowaway.'
@@ -62,7 +62,7 @@ if (-not $ConfirmThrowaway) {
 $Engine = (Resolve-Path -LiteralPath $Engine).Path
 New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
 $script:Checks = New-Object System.Collections.Generic.List[object]
-$script:RunsRoot = Join-Path $env:ProgramData 'Leftovers\runs'
+$script:RunsRoot = Join-Path $env:ProgramData 'KillItWithFire\runs'
 
 # ------------------------------------------------------------------------------------------ helpers
 
@@ -73,7 +73,7 @@ function Check {
 }
 
 function Invoke-Engine {
-    # Runs Leftovers in its own process (the way an RMM would) and returns the exit code and output.
+    # Runs Kill It With Fire in its own process (the way an RMM would) and returns the exit code and output.
     param([string[]] $Arguments, [string] $Exe = $HostExe)
     $out = Join-Path $StateDir ('engine-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.txt')
     $argLine = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Engine) + $Arguments
@@ -109,8 +109,8 @@ function Get-Journal {
     return @(Get-Content -LiteralPath $f | Where-Object { $_.Trim() } | ForEach-Object { $_ | ConvertFrom-Json })
 }
 
-if (-not ('LeftoversLab.Native' -as [type])) {
-    Add-Type -Namespace LeftoversLab -Name Native -MemberDefinition @"
+if (-not ('KillItWithFireLab.Native' -as [type])) {
+    Add-Type -Namespace KillItWithFireLab -Name Native -MemberDefinition @"
 [DllImport("ntdll.dll")]
 private static extern int NtQueryKey(IntPtr keyHandle, int keyInformationClass, IntPtr keyInformation, int length, out int resultLength);
 public static string GetKeyName(IntPtr keyHandle) {
@@ -131,7 +131,7 @@ function Get-RegPhysical {
     param([string] $Hive, [string] $Path)
     $k = Open-RegKey $Hive $Path
     if ($k) {
-        try { $n = [LeftoversLab.Native]::GetKeyName($k.Handle.DangerousGetHandle()) } finally { $k.Close() }
+        try { $n = [KillItWithFireLab.Native]::GetKeyName($k.Handle.DangerousGetHandle()) } finally { $k.Close() }
         if ($n -match '^(?i)\\REGISTRY\\MACHINE\\(.+)$') { return 'HKEY_LOCAL_MACHINE\' + $matches[1] }
         if ($n -match '^(?i)\\REGISTRY\\USER\\(.+)$') { return 'HKEY_USERS\' + $matches[1] }
     }
@@ -320,9 +320,9 @@ function Invoke-Msiexec {
 
 function New-TestApp {
     # A small synthetic app: a folder with files, an uninstall entry whose uninstaller is missing.
-    param([string] $Key, [string] $DisplayName, [string] $Folder, [string[]] $Files, [string] $Publisher = 'Leftovers Lab')
+    param([string] $Key, [string] $DisplayName, [string] $Folder, [string[]] $Files, [string] $Publisher = 'KillItWithFire Lab')
     New-Item -ItemType Directory -Force -Path $Folder | Out-Null
-    foreach ($f in $Files) { Set-Content -LiteralPath (Join-Path $Folder $f) -Value "Leftovers lab file $f $(Get-Date -Format o)" -Encoding ASCII }
+    foreach ($f in $Files) { Set-Content -LiteralPath (Join-Path $Folder $f) -Value "KillItWithFire lab file $f $(Get-Date -Format o)" -Encoding ASCII }
     $u = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$Key"
     New-Item -Path $u -Force | Out-Null
     New-ItemProperty -Path $u -Name DisplayName -Value $DisplayName -Force | Out-Null
@@ -524,7 +524,7 @@ switch ($Scenario) {
         # profiles\PuTTY.psd1 adds what identity can't see: the user's saved sessions and random seed.
         $pc = '{DDC95F26-92B1-4546-9678-5DC68DF76BA0}'
         if ((Get-MsiProductState $pc) -ne 5) { Check 'precondition: PuTTY 0.81 registered (run the putty scenario first)' $false; Finish }
-        $sessKey = 'HKCU:\Software\SimonTatham\PuTTY\Sessions\LeftoversTest'
+        $sessKey = 'HKCU:\Software\SimonTatham\PuTTY\Sessions\KillItWithFireTest'
         $rnd = Join-Path $env:APPDATA 'putty.rnd'
         New-Item -Path $sessKey -Force | Out-Null
         New-ItemProperty -Path $sessKey -Name HostName -Value 'lab.example' -Force | Out-Null
@@ -559,17 +559,17 @@ switch ($Scenario) {
     'hooks' {
         # One synthetic app hooked into Windows every way that needs no reboot to prove: each hook must
         # be found by its path, removed by L3, and put back EXACTLY by the restore.
-        $name = 'Leftovers Hooks Test'
-        $folder = 'C:\Program Files\LeftoversHooksTest'
+        $name = 'KillItWithFire Hooks Test'
+        $folder = 'C:\Program Files\KillItWithFireHooksTest'
         $exe = "$folder\hook.exe"
         $wl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
         $userinitBefore = (Get-ItemProperty -LiteralPath $wl).Userinit
         $appinitBefore = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows').AppInit_DLLs
-        New-TestApp 'LeftoversHooksTest' $name $folder @('hook.exe', 'hook.dll', 'readme.txt')
+        New-TestApp 'KillItWithFireHooksTest' $name $folder @('hook.exe', 'hook.dll', 'readme.txt')
         try {
             # IFEO debugger on a made-up exe name (never a real one).
-            New-Item -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\leftoverslabtarget.exe' -Force | Out-Null
-            Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\leftoverslabtarget.exe' -Name Debugger -Value "`"$exe`""
+            New-Item -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\killitwithfirelabtarget.exe' -Force | Out-Null
+            Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\killitwithfirelabtarget.exe' -Name Debugger -Value "`"$exe`""
             # AppInit list entry (LoadAppInit_DLLs stays as it is: the list is only data here). The list is
             # space-separated, so real apps write the 8.3 path; that also proves short-path matching.
             $short = (New-Object -ComObject Scripting.FileSystemObject).GetFile("$folder\hook.dll").ShortPath
@@ -583,27 +583,27 @@ switch ($Scenario) {
             # Active Setup, a folder context-menu verb, a file association, a Public Desktop shortcut.
             New-Item -Path 'HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{7E1F2A3B-LEFT-OVER-LAB0-000000000001}' -Force | Out-Null
             Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{7E1F2A3B-LEFT-OVER-LAB0-000000000001}' -Name StubPath -Value "`"$exe`" /peruser"
-            New-Item -Path 'HKLM:\SOFTWARE\Classes\Directory\shell\LeftoversLabVerb\command' -Force | Out-Null
-            Set-ItemProperty -Path 'HKLM:\SOFTWARE\Classes\Directory\shell\LeftoversLabVerb\command' -Name '(default)' -Value "`"$exe`" `"%1`""
-            New-Item -Path 'HKLM:\SOFTWARE\Classes\.leftoverslab' -Force | Out-Null
-            Set-ItemProperty -Path 'HKLM:\SOFTWARE\Classes\.leftoverslab' -Name '(default)' -Value 'LeftoversLab.File'
-            New-Item -Path 'HKLM:\SOFTWARE\Classes\LeftoversLab.File\shell\open\command' -Force | Out-Null
-            Set-ItemProperty -Path 'HKLM:\SOFTWARE\Classes\LeftoversLab.File\shell\open\command' -Name '(default)' -Value "`"$exe`" `"%1`""
+            New-Item -Path 'HKLM:\SOFTWARE\Classes\Directory\shell\KillItWithFireLabVerb\command' -Force | Out-Null
+            Set-ItemProperty -Path 'HKLM:\SOFTWARE\Classes\Directory\shell\KillItWithFireLabVerb\command' -Name '(default)' -Value "`"$exe`" `"%1`""
+            New-Item -Path 'HKLM:\SOFTWARE\Classes\.killitwithfirelab' -Force | Out-Null
+            Set-ItemProperty -Path 'HKLM:\SOFTWARE\Classes\.killitwithfirelab' -Name '(default)' -Value 'KillItWithFireLab.File'
+            New-Item -Path 'HKLM:\SOFTWARE\Classes\KillItWithFireLab.File\shell\open\command' -Force | Out-Null
+            Set-ItemProperty -Path 'HKLM:\SOFTWARE\Classes\KillItWithFireLab.File\shell\open\command' -Name '(default)' -Value "`"$exe`" `"%1`""
             $sh = New-Object -ComObject WScript.Shell
-            $lnk = $sh.CreateShortcut((Join-Path $env:PUBLIC 'Desktop\Leftovers Hooks Test.lnk')); $lnk.TargetPath = $exe; $lnk.Save()
+            $lnk = $sh.CreateShortcut((Join-Path $env:PUBLIC 'Desktop\KillItWithFire Hooks Test.lnk')); $lnk.TargetPath = $exe; $lnk.Save()
             # A scheduled task, a Run value (+ its StartupApproved twin), a firewall rule, a service.
-            Register-ScheduledTask -TaskName 'LeftoversLabHooksTask' -Action (New-ScheduledTaskAction -Execute $exe -Argument '/tick') -Trigger (New-ScheduledTaskTrigger -Daily -At 3am) -User 'SYSTEM' -Force | Out-Null
-            Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -Name 'LeftoversLabHooks' -Value "`"$exe`" /tray"
+            Register-ScheduledTask -TaskName 'KillItWithFireLabHooksTask' -Action (New-ScheduledTaskAction -Execute $exe -Argument '/tick') -Trigger (New-ScheduledTaskTrigger -Daily -At 3am) -User 'SYSTEM' -Force | Out-Null
+            Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -Name 'KillItWithFireLabHooks' -Value "`"$exe`" /tray"
             New-Item -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run' -Force -ErrorAction SilentlyContinue | Out-Null
-            New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run' -Name 'LeftoversLabHooks' -Value ([byte[]](2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)) -PropertyType Binary -Force | Out-Null
-            New-NetFirewallRule -Name 'LeftoversLabHooksRule' -DisplayName 'Leftovers Hooks Test' -Direction Inbound -Action Allow -Program $exe -Profile Any | Out-Null
-            New-Service -Name 'LeftoversLabHooksSvc' -BinaryPathName "`"$exe`" -service" -StartupType Manual -DisplayName 'Leftovers Hooks Test' | Out-Null
+            New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run' -Name 'KillItWithFireLabHooks' -Value ([byte[]](2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)) -PropertyType Binary -Force | Out-Null
+            New-NetFirewallRule -Name 'KillItWithFireLabHooksRule' -DisplayName 'KillItWithFire Hooks Test' -Direction Inbound -Action Allow -Program $exe -Profile Any | Out-Null
+            New-Service -Name 'KillItWithFireLabHooksSvc' -BinaryPathName "`"$exe`" -service" -StartupType Manual -DisplayName 'KillItWithFire Hooks Test' | Out-Null
             # Two top-level keys named for the keyword: one whose contents point at the app, one that
             # only shares the name (it must be review-only, never removed by default).
-            New-Item -Path 'HKLM:\SOFTWARE\Leftovers Lab\App' -Force | Out-Null
-            Set-ItemProperty -Path 'HKLM:\SOFTWARE\Leftovers Lab\App' -Name InstallPath -Value $folder
-            New-Item -Path 'HKLM:\SOFTWARE\Leftovers Unrelated' -Force | Out-Null
-            Set-ItemProperty -Path 'HKLM:\SOFTWARE\Leftovers Unrelated' -Name Setting -Value 'blue'
+            New-Item -Path 'HKLM:\SOFTWARE\KillItWithFire Lab\App' -Force | Out-Null
+            Set-ItemProperty -Path 'HKLM:\SOFTWARE\KillItWithFire Lab\App' -Name InstallPath -Value $folder
+            New-Item -Path 'HKLM:\SOFTWARE\KillItWithFire Unrelated' -Force | Out-Null
+            Set-ItemProperty -Path 'HKLM:\SOFTWARE\KillItWithFire Unrelated' -Name Setting -Value 'blue'
 
             $scan = Join-Path $StateDir 'hooks-scan'
             $r = Invoke-Engine @('-Name', $name, '-Level', '0', '-OutDir', $scan, '-Quiet')
@@ -614,12 +614,12 @@ switch ($Scenario) {
                 Check "plan has $c" ($cats -contains $c)
             }
             if ($testAppInit) { Check 'plan has AppInitDll (matched through the 8.3 path)' ($cats -contains 'AppInitDll') }
-            Check 'plan: the .leftoverslab extension stops naming our file type' (@($plan.items | Where-Object { $_.target -like '*\.leftoverslab : (default)' }).Count -eq 1)
+            Check 'plan: the .killitwithfirelab extension stops naming our file type' (@($plan.items | Where-Object { $_.target -like '*\.killitwithfirelab : (default)' }).Count -eq 1)
             $w = @($plan.items | Where-Object { $_.category -eq 'Winlogon' })
             Check 'Userinit: remove OUR entry only, keep the rest' ($w.Count -eq 1 -and $w[0].action -like '*keep every other entry*')
-            if ($plan.keyword.used -and $plan.keyword.value -eq 'Leftovers') {
-                $vk = @($plan.items | Where-Object { $_.target -like '*\SOFTWARE\Leftovers Lab' })
-                $uk = @($plan.items | Where-Object { $_.target -like '*\SOFTWARE\Leftovers Unrelated' })
+            if ($plan.keyword.used -and $plan.keyword.value -eq 'KillItWithFire') {
+                $vk = @($plan.items | Where-Object { $_.target -like '*\SOFTWARE\KillItWithFire Lab' })
+                $uk = @($plan.items | Where-Object { $_.target -like '*\SOFTWARE\KillItWithFire Unrelated' })
                 Check 'keyword key whose contents point at the app: planned normally' ($vk.Count -eq 1 -and -not $vk[0].review) $(if ($vk.Count) { $vk[0].evidence })
                 Check 'keyword key that only shares the name: review-only' ($uk.Count -eq 1 -and $uk[0].review)
             } else { Write-Host "skip: keyword is '$($plan.keyword.value)' ($($plan.keyword.reason))" }
@@ -633,11 +633,11 @@ switch ($Scenario) {
             Check 'L3: every hook and file is gone' ($left.Count -eq 0) ($left -join ', ')
             Check 'L3: Userinit is exactly what it was before the app' ((Get-ItemProperty -LiteralPath $wl).Userinit -eq $userinitBefore) (Get-ItemProperty -LiteralPath $wl).Userinit
             Check 'L3: AppInit_DLLs is exactly what it was before the app' ([string](Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows').AppInit_DLLs -eq [string]$appinitBefore)
-            Check 'L3: the StartupApproved twin went with the Run value' ((Get-ValueFingerprint 'HKLM64' 'SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run' 'LeftoversLabHooks') -eq 'absent')
+            Check 'L3: the StartupApproved twin went with the Run value' ((Get-ValueFingerprint 'HKLM64' 'SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run' 'KillItWithFireLabHooks') -eq 'absent')
             $r = Invoke-Engine @('-Restore', $run.runId, '-Force', '-Quiet')
             Check 'restore exit 0' ($r.Code -eq 0) "exit $($r.Code)"
             Compare-State $s0 (Get-PlanState $sel) 'restore: every hook back exactly (task XML, firewall rule, service, lists, keys, files)'
-            Check 'the unrelated key that only shares the name was never touched' ((Get-ValueFingerprint 'HKLM64' 'SOFTWARE\Leftovers Unrelated' 'Setting') -eq 'String:blue')
+            Check 'the unrelated key that only shares the name was never touched' ((Get-ValueFingerprint 'HKLM64' 'SOFTWARE\KillItWithFire Unrelated' 'Setting') -eq 'String:blue')
 
             # The app as the ONLY Userinit entry (kiosk and lockdown software do this): removing it must
             # put Windows' default back, never leave Userinit empty (no shell at sign-in).
@@ -667,17 +667,17 @@ switch ($Scenario) {
             # Leave the machine as it was, whatever happened above.
             Set-ItemProperty -Path $wl -Name Userinit -Value $userinitBefore
             Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows' -Name AppInit_DLLs -Value ([string]$appinitBefore)
-            Remove-Item -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\leftoverslabtarget.exe' -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\killitwithfirelabtarget.exe' -Recurse -Force -ErrorAction SilentlyContinue
             Remove-Item -Path 'HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{7E1F2A3B-LEFT-OVER-LAB0-000000000001}' -Recurse -Force -ErrorAction SilentlyContinue
-            Remove-Item -Path 'HKLM:\SOFTWARE\Classes\Directory\shell\LeftoversLabVerb', 'HKLM:\SOFTWARE\Classes\.leftoverslab', 'HKLM:\SOFTWARE\Classes\LeftoversLab.File' -Recurse -Force -ErrorAction SilentlyContinue
-            Remove-Item -Path 'HKLM:\SOFTWARE\Leftovers Lab', 'HKLM:\SOFTWARE\Leftovers Unrelated' -Recurse -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath (Join-Path $env:PUBLIC 'Desktop\Leftovers Hooks Test.lnk') -Force -ErrorAction SilentlyContinue
-            Unregister-ScheduledTask -TaskName 'LeftoversLabHooksTask' -Confirm:$false -ErrorAction SilentlyContinue
-            Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -Name 'LeftoversLabHooks' -ErrorAction SilentlyContinue
-            Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run' -Name 'LeftoversLabHooks' -ErrorAction SilentlyContinue
-            Remove-NetFirewallRule -Name 'LeftoversLabHooksRule' -ErrorAction SilentlyContinue
-            & sc.exe delete LeftoversLabHooksSvc 2>&1 | Out-Null
-            Remove-TestApp 'LeftoversHooksTest' $folder
+            Remove-Item -Path 'HKLM:\SOFTWARE\Classes\Directory\shell\KillItWithFireLabVerb', 'HKLM:\SOFTWARE\Classes\.killitwithfirelab', 'HKLM:\SOFTWARE\Classes\KillItWithFireLab.File' -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -Path 'HKLM:\SOFTWARE\KillItWithFire Lab', 'HKLM:\SOFTWARE\KillItWithFire Unrelated' -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath (Join-Path $env:PUBLIC 'Desktop\KillItWithFire Hooks Test.lnk') -Force -ErrorAction SilentlyContinue
+            Unregister-ScheduledTask -TaskName 'KillItWithFireLabHooksTask' -Confirm:$false -ErrorAction SilentlyContinue
+            Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -Name 'KillItWithFireLabHooks' -ErrorAction SilentlyContinue
+            Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run' -Name 'KillItWithFireLabHooks' -ErrorAction SilentlyContinue
+            Remove-NetFirewallRule -Name 'KillItWithFireLabHooksRule' -ErrorAction SilentlyContinue
+            & sc.exe delete KillItWithFireLabHooksSvc 2>&1 | Out-Null
+            Remove-TestApp 'KillItWithFireHooksTest' $folder
         }
     }
 
@@ -686,11 +686,11 @@ switch ($Scenario) {
         # services, drivers and logon hooks that could (their program is in the blocked folder) are held
         # back, the blocker is never overwritten, and a rerun once the cause is gone finishes the job.
         # (Until 2026-09-29 the first failure stopped everything older, on every rerun.)
-        $name = 'Leftovers Restore Test'
-        $folder = 'C:\Program Files\LeftoversRestoreTest'
+        $name = 'KillItWithFire Restore Test'
+        $folder = 'C:\Program Files\KillItWithFireRestoreTest'
         $svc = 'LtRestoreSvc'
-        New-TestApp 'LeftoversRestoreTest' $name $folder @('a.txt', 'b.txt', 'svc.exe')
-        & sc.exe create $svc type= own start= demand binPath= "`"$folder\svc.exe`"" DisplayName= 'Leftovers Restore Test' | Out-Null
+        New-TestApp 'KillItWithFireRestoreTest' $name $folder @('a.txt', 'b.txt', 'svc.exe')
+        & sc.exe create $svc type= own start= demand binPath= "`"$folder\svc.exe`"" DisplayName= 'KillItWithFire Restore Test' | Out-Null
         try {
             $r = Invoke-Engine @('-Name', $name, '-Level', '3', '-Force', '-Quiet')
             Check 'L3 exit 0' ($r.Code -eq 0) "exit $($r.Code)"
@@ -710,15 +710,15 @@ switch ($Scenario) {
             Check 'rerun: folder, entry and service back' ((Test-Path (Join-Path $folder 'a.txt')) -and [bool](Get-Uninstall $name) -and [bool](Get-Service $svc -ErrorAction SilentlyContinue))
         } finally {
             & sc.exe delete $svc | Out-Null
-            Remove-TestApp 'LeftoversRestoreTest' $folder
+            Remove-TestApp 'KillItWithFireRestoreTest' $folder
         }
     }
 
     'policy' {
-        $pol = 'HKLM:\SOFTWARE\Policies\Leftovers'
-        $name = 'Leftovers Policy Test'
-        $folder = 'C:\Program Files\LeftoversPolicyTest'
-        New-TestApp 'LeftoversPolicyTest' $name $folder @('app.exe.txt')
+        $pol = 'HKLM:\SOFTWARE\Policies\KillItWithFire'
+        $name = 'KillItWithFire Policy Test'
+        $folder = 'C:\Program Files\KillItWithFirePolicyTest'
+        New-TestApp 'KillItWithFirePolicyTest' $name $folder @('app.exe.txt')
         try {
             New-Item -Path $pol -Force | Out-Null
             New-ItemProperty -Path $pol -Name MaxLevel -Value 2 -PropertyType DWord -Force | Out-Null
@@ -752,7 +752,7 @@ switch ($Scenario) {
             Check 'restore: the uninstall entry is back' ([bool](Get-Uninstall $name))
         } finally {
             Remove-Item -LiteralPath $pol -Recurse -Force -ErrorAction SilentlyContinue
-            Remove-TestApp 'LeftoversPolicyTest' $folder
+            Remove-TestApp 'KillItWithFirePolicyTest' $folder
         }
     }
 
@@ -777,28 +777,28 @@ switch ($Scenario) {
             $r = Invoke-Engine @('-ProductCode', $ms, '-Level', '3', '-Force', '-Quiet')
             Check "a Microsoft MSI by ProductCode is refused ($ms)" ($r.Code -eq 2 -and $r.Output -match 'REFUSED') "exit $($r.Code)"
         } else { Write-Host 'skip: no Microsoft MSI product found' }
-        New-TestApp 'LeftoversSecurityTest' 'CrowdStrike Windows Sensor' 'C:\Program Files\LeftoversSecurityTest' @('csagent.txt') -Publisher 'CrowdStrike, Inc.'
+        New-TestApp 'KillItWithFireSecurityTest' 'CrowdStrike Windows Sensor' 'C:\Program Files\KillItWithFireSecurityTest' @('csagent.txt') -Publisher 'CrowdStrike, Inc.'
         try {
             $r = Invoke-Engine @('-Name', 'CrowdStrike Windows Sensor', '-Level', '3', '-Force', '-Quiet')
             Check 'a security product is refused, and names the vendor tool' ($r.Code -eq 2 -and $r.Output -match 'CsUninstallTool') "exit $($r.Code)"
-        } finally { Remove-TestApp 'LeftoversSecurityTest' 'C:\Program Files\LeftoversSecurityTest' }
-        New-TestApp 'LeftoversKeywordTest' 'Leftovers Keyword Test' 'C:\Program Files\LeftoversKeywordTest' @('a.txt')
+        } finally { Remove-TestApp 'KillItWithFireSecurityTest' 'C:\Program Files\KillItWithFireSecurityTest' }
+        New-TestApp 'KillItWithFireKeywordTest' 'KillItWithFire Keyword Test' 'C:\Program Files\KillItWithFireKeywordTest' @('a.txt')
         try {
-            $r = Invoke-Engine @('-Name', 'Leftovers Keyword Test', '-Keyword', 'Microsoft', '-Level', '0', '-OutDir', (Join-Path $StateDir 'kw-scan'), '-Quiet')
+            $r = Invoke-Engine @('-Name', 'KillItWithFire Keyword Test', '-Keyword', 'Microsoft', '-Level', '0', '-OutDir', (Join-Path $StateDir 'kw-scan'), '-Quiet')
             $plan = Get-Plan (Join-Path $StateDir 'kw-scan')
             Check '-Keyword Microsoft is refused (the scan still runs)' ($r.Code -eq 0 -and -not $plan.keyword.used -and $plan.keyword.reason -like 'REFUSED*') $plan.keyword.reason
-            $r = Invoke-Engine @('-Name', 'Leftovers Keyword Test', '-Keyword', 'Intune', '-Level', '0', '-OutDir', (Join-Path $StateDir 'kw-scan2'), '-Quiet')
+            $r = Invoke-Engine @('-Name', 'KillItWithFire Keyword Test', '-Keyword', 'Intune', '-Level', '0', '-OutDir', (Join-Path $StateDir 'kw-scan2'), '-Quiet')
             $plan = Get-Plan (Join-Path $StateDir 'kw-scan2')
             Check '-Keyword Intune is refused' (-not $plan.keyword.used) $plan.keyword.reason
-        } finally { Remove-TestApp 'LeftoversKeywordTest' 'C:\Program Files\LeftoversKeywordTest' }
+        } finally { Remove-TestApp 'KillItWithFireKeywordTest' 'C:\Program Files\KillItWithFireKeywordTest' }
         $r = Invoke-Engine @('-Name', 'No Such App 12345', '-Level', '0', '-Quiet')
         Check 'an unknown name is exit 3' ($r.Code -eq 3) "exit $($r.Code)"
     }
 
     'bitness' {
-        $name = 'Leftovers Bitness Test'
-        $folder = 'C:\Program Files\LeftoversBitnessTest'
-        New-TestApp 'LeftoversBitnessTest' $name $folder @('a.txt', 'b.txt')
+        $name = 'KillItWithFire Bitness Test'
+        $folder = 'C:\Program Files\KillItWithFireBitnessTest'
+        New-TestApp 'KillItWithFireBitnessTest' $name $folder @('a.txt', 'b.txt')
         try {
             $r64 = Invoke-Engine @('-Name', $name, '-Level', '0', '-OutDir', (Join-Path $StateDir 'bit64'), '-Quiet')
             $wow = Join-Path $env:SystemRoot 'SysWOW64\WindowsPowerShell\v1.0\powershell.exe'
@@ -810,16 +810,16 @@ switch ($Scenario) {
             $t32 = (@($p32.items | ForEach-Object { "$($_.category)|$($_.target)" }) | Sort-Object) -join "`n"
             Check '32-bit host finds exactly the 64-bit plan' ($t64 -eq $t32 -and $t64) "$(@($p64.items).Count) vs $(@($p32.items).Count) items"
             Check 'the install folder is C:\Program Files, not (x86)' (@($p32.items | Where-Object { $_.category -eq 'InstallRoot' -and $_.target -eq $folder }).Count -eq 1)
-        } finally { Remove-TestApp 'LeftoversBitnessTest' $folder }
+        } finally { Remove-TestApp 'KillItWithFireBitnessTest' $folder }
     }
 
     { $_ -in @('pending', 'resume') } {
         # A file held open with no sharing can't move now: it is scheduled for the next boot (exit 3010).
-        $name = 'Leftovers Locked Test'
-        $folder = 'C:\Program Files\LeftoversLockedTest'
+        $name = 'KillItWithFire Locked Test'
+        $folder = 'C:\Program Files\KillItWithFireLockedTest'
         $locked = Join-Path $folder 'locked.bin'
         if ($Phase -eq 'run') {
-            New-TestApp 'LeftoversLockedTest' $name $folder @('a.txt', 'locked.bin')
+            New-TestApp 'KillItWithFireLockedTest' $name $folder @('a.txt', 'locked.bin')
             $holder = Start-Process -FilePath $HostExe -ArgumentList '-NoProfile', '-Command', "`$f = [System.IO.File]::Open('$locked', 'Open', 'Read', 'None'); Start-Sleep -Seconds 1800" -PassThru -WindowStyle Hidden
             Start-Sleep -Seconds 3
             $r = Invoke-Engine @('-Name', $name, '-Level', '3', '-Force', '-Quiet')
@@ -840,12 +840,12 @@ switch ($Scenario) {
                 Check 'restore: both files and the entry are back' ((Test-Path $locked) -and (Test-Path (Join-Path $folder 'a.txt')) -and [bool](Get-Uninstall $name))
                 $r = Invoke-Engine @('-Resume', $run.runId, '-Quiet')
                 Check 'a restored run refuses -Resume (no reboot loop)' ($r.Code -eq 2) "exit $($r.Code)"
-                Remove-TestApp 'LeftoversLockedTest' $folder
+                Remove-TestApp 'KillItWithFireLockedTest' $folder
             }
         } elseif ($Phase -eq 'after') {
             $st = Read-State 'resume'
             Check 'after the reboot: the locked file moved' (-not (Test-Path $locked))
-            Check 'after the reboot: it is in the quarantine' (Test-Path (Join-Path $script:RunsRoot "$($st.runId)\files\C\Program Files\LeftoversLockedTest\locked.bin"))
+            Check 'after the reboot: it is in the quarantine' (Test-Path (Join-Path $script:RunsRoot "$($st.runId)\files\C\Program Files\KillItWithFireLockedTest\locked.bin"))
             $r = Invoke-Engine @('-Resume', $st.runId, '-Quiet')
             Check '-Resume exit 0' ($r.Code -eq 0) "exit $($r.Code)"
             $meta = Get-Content -LiteralPath (Join-Path $script:RunsRoot "$($st.runId)\run.json") -Raw | ConvertFrom-Json
@@ -854,16 +854,16 @@ switch ($Scenario) {
             $r = Invoke-Engine @('-Restore', $st.runId, '-Force', '-Quiet')
             Check 'restore after the reboot: exit 0' ($r.Code -eq 0) "exit $($r.Code)"
             Check 'restore: both files and the entry are back' ((Test-Path $locked) -and (Test-Path (Join-Path $folder 'a.txt')) -and [bool](Get-Uninstall $name))
-            Remove-TestApp 'LeftoversLockedTest' $folder
+            Remove-TestApp 'KillItWithFireLockedTest' $folder
         }
     }
 
     'filter' {
         # A fake "driver" registered as an UPPER FILTER of the keyboard class. The file is not a real
         # driver, so while it is listed the keyboard fails to start at boot: exactly what happens when a
-        # tool deletes a filter driver but leaves it listed. Leftovers must remove the class entry first.
-        $name = 'Leftovers Filter Test'
-        $folder = 'C:\Program Files\LeftoversFilterTest'
+        # tool deletes a filter driver but leaves it listed. Kill It With Fire must remove the class entry first.
+        $name = 'KillItWithFire Filter Test'
+        $folder = 'C:\Program Files\KillItWithFireFilterTest'
         $svc = 'LtFilter'
         $classKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4D36E96B-E325-11CE-BFC1-08002BE10318}'
         $kbd = { @(Get-PnpDevice -PresentOnly -Class Keyboard -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -like 'VMBUS*' -or $_.InstanceId -like 'ACPI*' -or $_.InstanceId -like 'HID*' }) }
@@ -871,9 +871,9 @@ switch ($Scenario) {
         switch ($Phase) {
             'setup' {
                 Check 'precondition: the keyboard works' (@(& $kbd | Where-Object { $_.Status -eq 'OK' }).Count -ge 1)
-                New-TestApp 'LeftoversFilterTest' $name $folder @('readme.txt')
+                New-TestApp 'KillItWithFireFilterTest' $name $folder @('readme.txt')
                 Set-Content -LiteralPath "$folder\ltfilter.sys" -Value 'not a driver' -Encoding ASCII
-                & sc.exe create $svc type= kernel start= demand binPath= "$folder\ltfilter.sys" DisplayName= 'Leftovers Filter Test' | Out-Null
+                & sc.exe create $svc type= kernel start= demand binPath= "$folder\ltfilter.sys" DisplayName= 'KillItWithFire Filter Test' | Out-Null
                 $u = @((Get-ItemProperty -LiteralPath $classKey -Name UpperFilters).UpperFilters) + $svc
                 Set-ItemProperty -LiteralPath $classKey -Name UpperFilters -Value ([string[]]$u) -Type MultiString
                 Check 'setup: keyboard class loads kbdclass,LtFilter' ((& $uppers) -eq 'kbdclass,LtFilter') (& $uppers)
@@ -1171,24 +1171,24 @@ switch ($Scenario) {
 
     'credprov' {
         # A credential provider whose DLL can't load, with the built-in password sign-in turned OFF: the
-        # machine nobody can sign in to. Leftovers must turn the password sign-in back on BEFORE it removes
+        # machine nobody can sign in to. Kill It With Fire must turn the password sign-in back on BEFORE it removes
         # the provider. The host tries a real sign-in (keyboard over Hyper-V) after each reboot.
-        $name = 'Leftovers Credential Test'
-        $folder = 'C:\Program Files\LeftoversCredTest'
+        $name = 'KillItWithFire Credential Test'
+        $folder = 'C:\Program Files\KillItWithFireCredTest'
         $clsid = '{6A1E5D3C-7B2F-4E8A-9C0D-1F2E3D4C5B6A}'
         $pw = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Providers\{60b78e88-EAD8-445C-9CFD-0B87F74EA6CD}'
         $cp = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Providers\$clsid"
         $pwOff = { $v = Get-ItemProperty -LiteralPath $pw -ErrorAction SilentlyContinue; [bool]($v -and ($v.PSObject.Properties.Name -contains 'Disabled') -and $v.Disabled -eq 1) }
         switch ($Phase) {
             'setup' {
-                New-TestApp 'LeftoversCredTest' $name $folder @('readme.txt')
+                New-TestApp 'KillItWithFireCredTest' $name $folder @('readme.txt')
                 Set-Content -LiteralPath "$folder\ltcred.dll" -Value 'not a dll' -Encoding ASCII
                 New-Item -Path "HKLM:\SOFTWARE\Classes\CLSID\$clsid\InprocServer32" -Force | Out-Null
-                Set-ItemProperty -Path "HKLM:\SOFTWARE\Classes\CLSID\$clsid" -Name '(default)' -Value 'Leftovers Credential Test'
+                Set-ItemProperty -Path "HKLM:\SOFTWARE\Classes\CLSID\$clsid" -Name '(default)' -Value 'KillItWithFire Credential Test'
                 Set-ItemProperty -Path "HKLM:\SOFTWARE\Classes\CLSID\$clsid\InprocServer32" -Name '(default)' -Value "$folder\ltcred.dll"
                 Set-ItemProperty -Path "HKLM:\SOFTWARE\Classes\CLSID\$clsid\InprocServer32" -Name 'ThreadingModel' -Value 'Apartment'
                 New-Item -Path $cp -Force | Out-Null
-                Set-ItemProperty -Path $cp -Name '(default)' -Value 'Leftovers Credential Test'
+                Set-ItemProperty -Path $cp -Name '(default)' -Value 'KillItWithFire Credential Test'
                 New-ItemProperty -Path $pw -Name Disabled -Value 1 -PropertyType DWord -Force | Out-Null
                 Check 'setup: password sign-in is OFF, our provider registered' ((& $pwOff) -and (Test-Path $cp))
             }

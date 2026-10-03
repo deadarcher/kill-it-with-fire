@@ -1,17 +1,24 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Leftovers - clean up what a broken app left behind: a plan with the evidence for every item, a
-    backup of everything it changes, and a restore.
+    Kill It With Fire - remove a Windows app completely, the proper way or the hard way: a plan with the
+    evidence for every item, a backup of everything it changes, and a restore.
 
 .DESCRIPTION
-    For an app whose uninstall is ALREADY broken: the cached MSI is gone, the UninstallString points
-    at a deleted exe, files are half removed. If msiexec /x or the vendor uninstaller still works, use
-    that first. Leftovers is the second attempt, not the first.
+    Two ways to remove an app:
+      The proper way (the default): the app's own uninstaller runs first, silently, and then whatever it
+      left behind is cleaned up. For an MSI that is msiexec /x. For an EXE it is the app's registered
+      quiet uninstall command, or the silent switch of the engine that built its uninstaller (NSIS, Inno
+      Setup, WiX Burn, InstallShield, InstallAware), recognised from markers inside the uninstaller.
+      -KillIt, the hard way: skip the uninstaller and scrub the app out at level 3. For an uninstaller
+      that is broken, hangs, or wants a click nobody is there to give.
+    Either way, a scan comes first, every change is backed up, and the protected list (Microsoft
+    software, security agents, Windows itself) is never touched.
 
     Levels are cumulative:
       0  Scan only. Writes plan.json and report.txt. Changes nothing.
-      1  Uninstall. Runs the app's own uninstaller once (msiexec /x or its QuietUninstallString).
+      1  Uninstall. Runs the app's own uninstaller once, silently (see above). One with no known silent
+         switch is skipped rather than left waiting for a click.
       2  Registration cleanup. Removes the uninstall entry and the Windows Installer registration, so a
          reinstall should work. Files are not touched.
       3  Full scrub. Unhooks the app from Windows (logon hooks first, then device filters, network
@@ -27,7 +34,7 @@
 
     With no arguments it opens a window (Disk Cleanup style) that drives the same engine.
 
-    Administrators can lock options with policy values under HKLM\SOFTWARE\Policies\Leftovers:
+    Administrators can lock options with policy values under HKLM\SOFTWARE\Policies\KillItWithFire:
       MaxLevel (DWORD), RequireBackup (DWORD 1), RequireLog (DWORD 1), LogPath (string),
       AllowUserData (DWORD 0/1), QuarantineDays (DWORD).
     The engine enforces them: a switch past the policy is refused. The window only greys them out.
@@ -53,6 +60,9 @@
     Also act on items tied only by vendor name, signer, or a single MSI claim on a System32 file.
 .PARAMETER SkipUninstall
     At level 2 or 3, don't try the app's own uninstaller first.
+.PARAMETER KillIt
+    The hard way: skip the app's own uninstaller and scrub it out (level 3, with -SkipUninstall). Leave
+    -Level out, or give 3. A backup is still taken, so -Restore can put the app back.
 .PARAMETER NoBackup
     Don't back up before changing things (refused when policy requires a backup). -Restore can't undo
     such a run.
@@ -86,24 +96,24 @@
     Don't print the report. Files and exit code are unchanged.
 
 .EXAMPLE
-    .\Leftovers.ps1
+    .\KillItWithFire.ps1
     Opens the window.
 .EXAMPLE
-    .\Leftovers.ps1 -Name "Notepad++ (64-bit x64)"
+    .\KillItWithFire.ps1 -Name "Notepad++ (64-bit x64)"
     Scan only: writes the plan and prints the report.
 .EXAMPLE
-    .\Leftovers.ps1 -ProductCode "{DDC95F26-92B1-4546-9678-5DC68DF76BA0}" -Level 2 -Force
+    .\KillItWithFire.ps1 -ProductCode "{DDC95F26-92B1-4546-9678-5DC68DF76BA0}" -Level 2 -Force
     Registration cleanup of an MSI whose cached package is gone, unattended.
 .EXAMPLE
-    .\Leftovers.ps1 -ListRuns
-    .\Leftovers.ps1 -Restore 20260926-013000-1a2b3c
+    .\KillItWithFire.ps1 -ListRuns
+    .\KillItWithFire.ps1 -Restore 20260926-013000-1a2b3c
 
 .NOTES
     Exit codes: 0 done, 3010 done but a reboot is needed (then -Resume), 1 stopped part way (the run
     can be restored), 2 refused (policy, protected product, ambiguous name, or no confirmation),
     3 bad input, not found, or not elevated, 4 stopped on an unexpected error.
     Runs on Windows PowerShell 5.1 and PowerShell 7, elevated (admin or SYSTEM), 64-bit.
-    https://github.com/deadarcher/leftovers - MIT license.
+    https://github.com/deadarcher/kill-it-with-fire - MIT license.
 #>
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingEmptyCatchBlock', '', Justification = 'Best-effort reads: an unreadable key or file is skipped (and counted where it matters), never fatal.')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '', Justification = 'Script parameters are read inside functions through scope inheritance.')]
@@ -143,6 +153,9 @@ param(
 
     [Parameter(ParameterSetName = 'Run')]
     [switch] $SkipUninstall,
+
+    [Parameter(ParameterSetName = 'Run')]
+    [switch] $KillIt,
 
     [Parameter(ParameterSetName = 'Run')]
     [switch] $NoBackup,
@@ -196,7 +209,7 @@ param(
 )
 
 Set-StrictMode -Version 2.0
-$script:ToolVersion = '0.3.0'
+$script:ToolVersion = '0.4.0'
 $script:ScriptPath = $PSCommandPath
 
 # =====================================================================================================
@@ -563,8 +576,8 @@ function Get-RefusalReason {
     # Protected products are refused at PLAN time, re-checked once the real publisher and signer are
     # known: a -ProductCode run with no uninstall entry starts with an empty publisher (review 2026-09-26).
     param([string] $Publisher, [string] $DisplayName, [string] $SignerOrg)
-    if (Test-IsMicrosoftName $Publisher) { return "Microsoft product ($Publisher). Leftovers never touches Microsoft software, runtimes or management agents; use Settings, the Windows feature tools, or Microsoft's own support tool." }
-    if ($Publisher -match '(?i)\bVitko Software\b' -or $DisplayName -match '^(?i)RFF (Agent|Updater)\b' -or $SignerOrg -match '(?i)\bVitko Software\b') { return 'This is the RFF agent. Leftovers never removes the agent it may be running under.' }
+    if (Test-IsMicrosoftName $Publisher) { return "Microsoft product ($Publisher). Kill It With Fire never touches Microsoft software, runtimes or management agents; use Settings, the Windows feature tools, or Microsoft's own support tool." }
+    if ($Publisher -match '(?i)\bVitko Software\b' -or $DisplayName -match '^(?i)RFF (Agent|Updater)\b' -or $SignerOrg -match '(?i)\bVitko Software\b') { return 'This is the RFF agent. Kill It With Fire never removes the agent it may be running under.' }
     foreach ($v in $script:SecurityVendors.Keys) {
         if ((Test-WholeWord $Publisher $v) -or (Test-WholeWord $DisplayName $v) -or (Test-WholeWord $SignerOrg $v)) {
             return "Security product ($v). Tamper protection makes a generic removal unpredictable. Use $($script:SecurityVendors[$v])."
@@ -627,8 +640,8 @@ function Get-CategoryGroup {
     return 'Other'
 }
 
-function Get-LeftoversPolicy {
-    # Administrator locks from HKLM\SOFTWARE\Policies\Leftovers (GPO / Intune). Missing = not locked.
+function Get-KillItWithFirePolicy {
+    # Administrator locks from HKLM\SOFTWARE\Policies\KillItWithFire (GPO / Intune). Missing = not locked.
     param([string] $Json)
     $p = [ordered]@{ MaxLevel = $null; RequireBackup = $false; RequireLog = $false; LogPath = $null; AllowUserData = $null; QuarantineDays = $null; Source = $null }
     if ($Json) {
@@ -645,9 +658,9 @@ function Get-LeftoversPolicy {
     }
     $k = $null
     try {
-        $k = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64).OpenSubKey('SOFTWARE\Policies\Leftovers')
+        $k = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64).OpenSubKey('SOFTWARE\Policies\KillItWithFire')
         if ($k) {
-            $p.Source = 'HKLM\SOFTWARE\Policies\Leftovers'
+            $p.Source = 'HKLM\SOFTWARE\Policies\KillItWithFire'
             $v = $k.GetValue('MaxLevel', $null); if ($null -ne $v) { $p.MaxLevel = [int]$v }
             $p.RequireBackup = ([int](0 + $k.GetValue('RequireBackup', 0)) -eq 1)
             $p.RequireLog = ([int](0 + $k.GetValue('RequireLog', 0)) -eq 1)
@@ -657,6 +670,16 @@ function Get-LeftoversPolicy {
         }
     } catch { } finally { if ($k) { $k.Close() } }
     return [pscustomobject]$p
+}
+
+function Resolve-RunLevel {
+    # -KillIt is a level 3 run with -SkipUninstall, and nothing more: the caller applies the policy, the
+    # refusals and the backup to the RESULT, so -KillIt can never reach what that pair could not. Level 0 is
+    # the parameter's default, so it reads as "not given"; 1 and 2 contradict -KillIt and are refused.
+    param([int] $Level, [bool] $KillIt, [bool] $SkipUninstall)
+    if (-not $KillIt) { return @{ Level = $Level; SkipUninstall = $SkipUninstall } }
+    if ($Level -ne 0 -and $Level -ne 3) { return @{ Error = "-KillIt is a level 3 run; leave -Level $Level out." } }
+    return @{ Level = 3; SkipUninstall = $true }
 }
 
 function Get-PolicyViolations {
@@ -789,13 +812,16 @@ function Format-CommandLine {
     param([string] $AppName, [string] $ProductCode, [int] $Level, [string[]] $Exclude, [bool] $IncludeUserData, [bool] $IncludeReview,
         [bool] $NoBackup, [bool] $NoLog, [string] $LogPath, [bool] $SkipUninstall = $false)
     $q = { param($s) "'" + ([string]$s).Replace("'", "''") + "'" }
-    $parts = @('.\Leftovers.ps1')
+    $parts = @('.\KillItWithFire.ps1')
     if ($ProductCode) { $parts += "-ProductCode $(& $q $ProductCode)" } elseif ($AppName) { $parts += "-Name $(& $q $AppName)" }
     $parts += "-Level $Level"
+    # A level 3 run that skips the uninstaller IS -KillIt; say it the way a person would type it.
+    $killIt = ($SkipUninstall -and $Level -eq 3)
+    if ($killIt) { $parts[-1] = '-KillIt' }
     if ($Level -ge 2 -and $Exclude -and @($Exclude).Count) { $parts += "-Exclude $((@($Exclude)) -join ',')" }
     if ($IncludeUserData) { $parts += '-IncludeUserData' }
     if ($IncludeReview) { $parts += '-IncludeReview' }
-    if ($SkipUninstall -and $Level -ge 1) { $parts += '-SkipUninstall' }
+    if ($SkipUninstall -and $Level -ge 1 -and -not $killIt) { $parts += '-SkipUninstall' }
     if ($NoBackup) { $parts += '-NoBackup' }
     if ($NoLog) { $parts += '-NoLog' } elseif ($LogPath) { $parts += "-Log $(& $q $LogPath)" }
     if ($Level -ge 1) { $parts += '-Force' }
@@ -894,7 +920,7 @@ function Get-KeyNativePath {
     try { $k = $script:Base[$Hive].OpenSubKey($Path, $false) } catch { return $null }
     if ($null -eq $k) { return $null }
     $n = $null
-    try { $n = [Leftovers.Native]::GetKeyName($k.Handle.DangerousGetHandle()) } catch { } finally { $k.Close() }
+    try { $n = [KillItWithFire.Native]::GetKeyName($k.Handle.DangerousGetHandle()) } catch { } finally { $k.Close() }
     if ($n -match '^(?i)\\REGISTRY\\MACHINE\\(.+)$') { return 'HKEY_LOCAL_MACHINE\' + $matches[1] }
     if ($n -match '^(?i)\\REGISTRY\\USER\\(.+)$') { return 'HKEY_USERS\' + $matches[1] }
     return $null
@@ -1291,7 +1317,7 @@ function Import-AppProfile {
     }
 }
 
-function New-LeftoversPlan {
+function New-KillItWithFirePlan {
     # Discovery. Read-only. Returns @{ Code; Plan } where Code 0 = plan built, 2 = refused / ambiguous,
     # 3 = not found / bad input. Writes nothing.
     param([string] $AppName, [string] $AppProductCode, [string] $AppUpgradeCode, [string] $AppKeyword, [scriptblock] $Say, [object[]] $AppProfiles)
@@ -1354,13 +1380,13 @@ function New-LeftoversPlan {
     $primary = $matched[0]
     $targetName = if ($primary.DisplayName) { $primary.DisplayName } else { $primary.ProductCode }
     $publisher = $primary.Publisher
-    & $Say "Leftovers $script:ToolVersion - scanning '$targetName' (read-only)"
+    & $Say "Kill It With Fire $script:ToolVersion - scanning '$targetName' (read-only)"
 
     $refusal = Get-RefusalReason $publisher $targetName $null
     if ($refusal) {
         # Refused on its face (publisher or name): don't even read the rest.
         return @{ Code = 2; Message = "REFUSED: $refusal"; Plan = [ordered]@{
-                tool = 'Leftovers'; version = $script:ToolVersion; runId = $runId; computer = $env:COMPUTERNAME; generatedUtc = (Get-Date).ToUniversalTime().ToString('o')
+                tool = 'KillItWithFire'; version = $script:ToolVersion; runId = $runId; computer = $env:COMPUTERNAME; generatedUtc = (Get-Date).ToUniversalTime().ToString('o')
                 level = 0; refused = $refusal
                 target = [ordered]@{ displayName = $targetName; version = $primary.DisplayVersion; publisher = $publisher; productCode = $primary.ProductCode; upgradeCode = $null
                     isMsi = [bool]$primary.IsMsi; uninstallEntries = @($matched | ForEach-Object { $_.Display } | Where-Object { $_ }); uninstallString = $primary.UninstallString
@@ -1506,10 +1532,11 @@ function New-LeftoversPlan {
         foreach ($d in @(Get-ChildItem -LiteralPath $pr.Path -Directory -Force -Filter 'OneDrive*' -ErrorAction SilentlyContinue)) { $treeProtected += $d.FullName }
         $treeProtected += @($pr.ShellFolders)
     }
-    # Leftovers' own folders: its runs (backups and quarantine), the per-drive quarantines, and the folder
-    # the script runs from. A lab app named "Leftovers ... Test" derived the keyword "Leftovers" and the
-    # run tried to quarantine its own backups (2026-09-26).
-    $treeProtected += @(Get-LeftoversOwnFolders)
+    # Kill It With Fire's own folders: its runs (backups and quarantine), the per-drive quarantines, and the folder
+    # the script runs from. Under the tool's first name, a lab app named "Leftovers ... Test" derived the keyword
+    # "Leftovers", matched C:\ProgramData\Leftovers, and the run tried to quarantine its own backups (2026-09-26).
+    # The lab apps are now "KillItWithFire ... Test", so the keyword still equals the folder name.
+    $treeProtected += @(Get-KillItWithFireOwnFolders)
     foreach ($svcName in @('RFFAgent', 'RFFUpdater')) {
         $sk = Open-Key 'HKLM64' "SYSTEM\CurrentControlSet\Services\$svcName"
         if ($sk) {
@@ -1638,9 +1665,12 @@ function New-LeftoversPlan {
         uninstallEntries = @($matched | ForEach-Object { $_.Display } | Where-Object { $_ })
         uninstallString = $primary.UninstallString; quietUninstallString = $primary.QuietUninstallString
         cachedMsi = $localPackage; cachedMsiPresent = $localPackageExists
+        # Level 1 needs these: NSIS runs in place from InstallLocation, and a per-user entry's uninstaller
+        # is only run by that user (as anyone else it would act on the wrong profile).
+        installLocation = $primary.InstallLocation; entryHive = $primary.Hive; entrySid = $primary.Sid; entryKeyPath = $primary.KeyPath
     }
     $planBase = [ordered]@{
-        tool = 'Leftovers'; version = $script:ToolVersion; runId = $runId; computer = $env:COMPUTERNAME
+        tool = 'KillItWithFire'; version = $script:ToolVersion; runId = $runId; computer = $env:COMPUTERNAME
         generatedUtc = (Get-Date).ToUniversalTime().ToString('o'); level = 0; refused = $null; target = $target
     }
     if ($refusal) {
@@ -2815,7 +2845,7 @@ function Format-Report {
     $sb = New-Object System.Text.StringBuilder
     $line = { param($t) [void]$sb.AppendLine($t) }
     $t = $Plan.target
-    & $line "Leftovers $($Plan.version) - $(if ($Result) { "level $($Result.level) run" } else { 'scan (dry run: NOTHING was changed)' })"
+    & $line "Kill It With Fire $($Plan.version) - $(if ($Result) { "level $($Result.level) run" } else { 'scan (dry run: NOTHING was changed)' })"
     & $line "Computer: $($Plan.computer)    Run: $($Plan.runId)"
     & $line ''
     & $line "Target:    $($t.displayName) $($t.version)"
@@ -2900,21 +2930,21 @@ function Write-PlanFiles {
 
 $script:Run = $null
 
-function Get-RunsRoot { return (Join-Path $env:ProgramData 'Leftovers\runs') }
+function Get-RunsRoot { return (Join-Path $env:ProgramData 'KillItWithFire\runs') }
 
-function Get-LeftoversOwnFolders {
-    # Leftovers' own folders: the runs (backups, journals, quarantine for C:), each drive's .leftovers
+function Get-KillItWithFireOwnFolders {
+    # Kill It With Fire's own folders: the runs (backups, journals, quarantine for C:), each drive's .killitwithfire
     # quarantine, and the folder the script runs from (its profiles live there).
     $dirs = @((Split-Path (Get-RunsRoot) -Parent), (Split-Path $script:ScriptPath -Parent))
     # [IO.Path]::Combine, not Join-Path: a fixed drive need not be a PowerShell drive (Join-Path throws).
-    foreach ($drv in @([System.IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady })) { $dirs += [System.IO.Path]::Combine($drv.RootDirectory.FullName, '.leftovers') }
+    foreach ($drv in @([System.IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady })) { $dirs += [System.IO.Path]::Combine($drv.RootDirectory.FullName, '.killitwithfire') }
     return $dirs
 }
 
 function Get-OwnFolderConflict {
     # The own folder a path is inside of, or contains; $null when it touches none.
     param([string] $Path)
-    foreach ($sd in @(Get-LeftoversOwnFolders)) { if ((Test-PathUnder $Path $sd) -or (Test-PathUnder $sd $Path)) { return $sd } }
+    foreach ($sd in @(Get-KillItWithFireOwnFolders)) { if ((Test-PathUnder $Path $sd) -or (Test-PathUnder $sd $Path)) { return $sd } }
     return $null
 }
 
@@ -2922,7 +2952,7 @@ function Get-QuarantineRoot {
     # Same volume as what it holds, so a move is a rename: it can't fail halfway on a full disk.
     param([string] $RunId, [string] $Volume)
     if ($Volume.Equals($env:SystemDrive, [StringComparison]::OrdinalIgnoreCase)) { return (Join-Path (Get-RunsRoot) "$RunId\files\$($Volume.TrimEnd(':'))") }
-    return "$Volume\.leftovers\$RunId\files"
+    return "$Volume\.killitwithfire\$RunId\files"
 }
 
 function Invoke-Native {
@@ -2963,8 +2993,8 @@ function Get-JournalRecords {
     return @(Get-Content -LiteralPath $Path -Encoding UTF8 | Where-Object { $_.Trim() } | ForEach-Object { $_ | ConvertFrom-Json })
 }
 
-if (-not ('Leftovers.Native' -as [type])) {
-    Add-Type -Namespace Leftovers -Name Native -MemberDefinition @'
+if (-not ('KillItWithFire.Native' -as [type])) {
+    Add-Type -Namespace KillItWithFire -Name Native -MemberDefinition @'
 [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
 public static extern bool MoveFileEx(string existingFileName, string newFileName, int flags);
 // Remove an (empty) folder at the next boot. A real NULL destination: PowerShell turns $null into "".
@@ -3014,7 +3044,7 @@ function Move-PathOrSchedule {
         return 'moved'
     } catch {
         if (Test-Path -LiteralPath $Source -PathType Container) { throw }
-        if ([Leftovers.Native]::MoveFileEx($Source, $Destination, 0x4)) { return 'pending' }
+        if ([KillItWithFire.Native]::MoveFileEx($Source, $Destination, 0x4)) { return 'pending' }
         throw "could not move or schedule $Source ($($_.Exception.Message))"
     }
 }
@@ -3058,7 +3088,7 @@ function Move-TreeToQuarantine {
     if (-not $left.Count) { try { [System.IO.Directory]::Delete($Source, $false) } catch { } }
     if (-not (Test-Path -LiteralPath $Source)) {
         $Moves.Add([pscustomobject]@{ src = $Source; dst = $dest; state = 'emptied'; sddl = $sddl })
-    } elseif ([Leftovers.Native]::DeleteOnReboot($Source)) {
+    } elseif ([KillItWithFire.Native]::DeleteOnReboot($Source)) {
         # Boot-time operations run in the order they were scheduled: its contents first, then the folder.
         $Moves.Add([pscustomobject]@{ src = $Source; dst = $dest; state = 'emptied-pending'; sddl = $sddl })
     } else { throw "could not remove the emptied folder $Source, or schedule its removal at the next boot" }
@@ -3221,7 +3251,7 @@ function Invoke-PrimitiveOp {
                     $rec.result = if ($state -eq 'pending') { 'pending' } else { 'done' }
                 } elseif ($Op.quarantineImage -and $Op.image -and (Test-Path -LiteralPath $Op.image -PathType Leaf)) {
                     try { Remove-Item -LiteralPath $Op.image -Force -ErrorAction Stop; $rec.result = 'done' }
-                    catch { if ([Leftovers.Native]::DeleteOnReboot([string]$Op.image)) { $rec.result = 'pending' } else { throw "could not delete $($Op.image) now or at the next boot" } }
+                    catch { if ([KillItWithFire.Native]::DeleteOnReboot([string]$Op.image)) { $rec.result = 'pending' } else { throw "could not delete $($Op.image) now or at the next boot" } }
                 } else { $rec.result = 'skipped' }
                 break
             }
@@ -3256,7 +3286,7 @@ function Invoke-PrimitiveOp {
                     # -NoBackup: deleted like every other file in such a run (the driver may still be loaded:
                     # then it goes at the next boot).
                     try { Remove-Item -LiteralPath $Op.image -Force -ErrorAction Stop }
-                    catch { if ([Leftovers.Native]::DeleteOnReboot([string]$Op.image)) { $pending = $true } else { throw "could not delete $($Op.image) now or at the next boot" } }
+                    catch { if ([KillItWithFire.Native]::DeleteOnReboot([string]$Op.image)) { $pending = $true } else { throw "could not delete $($Op.image) now or at the next boot" } }
                 }
             }
             $rec.result = if ($pending) { 'pending' } else { 'done' }
@@ -3312,9 +3342,9 @@ function Invoke-PrimitiveOp {
             $rec.result = 'done'
         }
         'FileQuarantine' {
-            # Never Leftovers' own folders, whatever a plan says (a plan file is only JSON on disk).
+            # Never Kill It With Fire's own folders, whatever a plan says (a plan file is only JSON on disk).
             $own = Get-OwnFolderConflict ([string]$Op.path)
-            if ($own) { throw "refusing to move $($Op.path): it is or holds Leftovers' own folder $own" }
+            if ($own) { throw "refusing to move $($Op.path): it is or holds Kill It With Fire's own folder $own" }
             if (-not (Test-Path -LiteralPath $Op.path)) { $rec.result = 'skipped'; break }
             if (-not $script:Run.Backup) {
                 if (Test-Path -LiteralPath $Op.path -PathType Container) { Remove-TreeLongPath ([string]$Op.path) } else { Remove-Item -LiteralPath $Op.path -Force -ErrorAction Stop }
@@ -3326,9 +3356,9 @@ function Invoke-PrimitiveOp {
             $qroot = Get-QuarantineRoot $script:Run.RunId $vol
             if (-not (Test-Path -LiteralPath $qroot)) {
                 [void](New-Item -ItemType Directory -Path $qroot -Force)
-                $top = if ($vol -eq $env:SystemDrive) { $script:Run.Root } else { "$vol\.leftovers" }
+                $top = if ($vol -eq $env:SystemDrive) { $script:Run.Root } else { "$vol\.killitwithfire" }
                 Protect-Folder $top
-                if ($top -like '*\.leftovers') { try { (Get-Item -LiteralPath $top -Force).Attributes = 'Hidden, Directory' } catch { } }
+                if ($top -like '*\.killitwithfire') { try { (Get-Item -LiteralPath $top -Force).Attributes = 'Hidden, Directory' } catch { } }
             }
             $moves = New-Object System.Collections.Generic.List[object]
             try { Move-TreeToQuarantine ([string]$Op.path) $qroot @($Op.keep) $moves } finally { $rec.moves = $moves.ToArray() }
@@ -3363,23 +3393,144 @@ function Invoke-PrimitiveOp {
     return $rec.result
 }
 
+# ---- Level 1: the app's own uninstaller -----------------------------------------------------------
+# Which engine built an uninstaller, from structural markers in its first 4 MB. A PORT of the RFF agent's
+# InstallerFingerprint.cs: the same markers, searched in the same order, and the same switches. Keep the
+# two in step. The markers are what the build tools always emit, not marketing text.
+$script:InstallerEngineMarkers = @(
+    @('WixBurn', '.wixburn'), @('Nsis', 'NullsoftInst'), @('Nsis', 'Nullsoft Install System'),
+    @('InnoSetup', 'Inno Setup Setup Data'), @('InnoSetup', 'JR.Inno.Setup'),
+    @('InstallShield', 'InstallShield'), @('InstallAware', 'InstallAware'))
+$script:EngineUninstallArgs = @{
+    Nsis = '/S'; InnoSetup = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART'; WixBurn = '/uninstall /quiet /norestart'
+    InstallShield = '-s'; InstallAware = '/s'
+}
+
+function Get-InstallerEngine {
+    # 'Nsis', 'InnoSetup', 'WixBurn', 'InstallShield', 'InstallAware' or 'Unknown'. Never throws: an
+    # unreadable file is Unknown, which can only make level 1 skip, never act.
+    param([string] $Path)
+    try {
+        if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return 'Unknown' }
+        $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite, Delete')
+        try {
+            $len = [int][Math]::Min($fs.Length, 4MB)
+            if ($len -lt 64) { return 'Unknown' }
+            $buf = New-Object byte[] $len
+            $read = 0
+            while ($read -lt $len) { $n = $fs.Read($buf, $read, $len - $read); if ($n -le 0) { break }; $read += $n }
+        } finally { $fs.Dispose() }
+        # Latin-1 maps every byte to one char, so an ASCII marker is a plain ordinal IndexOf.
+        $text = [System.Text.Encoding]::GetEncoding(28591).GetString($buf, 0, $read)
+        foreach ($m in $script:InstallerEngineMarkers) { if ($text.IndexOf($m[1], [StringComparison]::Ordinal) -ge 0) { return $m[0] } }
+        return 'Unknown'
+    } catch { return 'Unknown' }
+}
+
+function New-UninstallCommand {
+    # Every key, always: the script runs under Set-StrictMode, where reading a key a hashtable lacks
+    # THROWS (PropertyNotFoundStrict). A result without Skip crashed the first unit test of a healthy app,
+    # which is exactly the run that would have hit it next.
+    param([string] $Exe, [string] $Arguments, [string] $How, [string] $Skip, [string] $Fail)
+    return @{ Exe = $Exe; Args = $Arguments; How = $How; Skip = $Skip; Fail = $Fail }
+}
+
+function Get-UninstallCommand {
+    # What level 1 runs, as @{ Exe; Args; How }, or @{ Skip = why } / @{ Fail = why }. Silent or nothing:
+    # an uninstaller with no known silent switch would sit on a dialog nobody can click (as SYSTEM, for the
+    # whole ten-minute timeout), so it is skipped and the scrub does the work.
+    param($Target)
+    $msiexec = Join-Path $env:SystemRoot 'System32\msiexec.exe'
+    if ($Target.isMsi -and $Target.productCode) { return (New-UninstallCommand -Exe $msiexec -Arguments "/x $($Target.productCode) /qn /norestart" -How 'msiexec /x') }
+    # A per-user entry's uninstaller acts on whoever runs it, so only that user runs it.
+    # Fields added to the plan on 2026-10-03 go through Get-Prop: an older plan.json lacks them, and a direct
+    # read throws under strict mode.
+    $sid = Get-Prop $Target 'entrySid'; $loc = Get-Prop $Target 'installLocation'
+    if ($sid) {
+        $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        if ($me -ne $sid) { return (New-UninstallCommand -Skip "a per-user install ($sid): its uninstaller would run as $([Environment]::UserName) and act on the wrong profile. The scrub removes it.") }
+    }
+    $from = $null; $line = $null
+    if ($Target.quietUninstallString) { $from = 'QuietUninstallString'; $line = [string]$Target.quietUninstallString }
+    elseif ($Target.uninstallString) { $from = 'UninstallString'; $line = [string]$Target.uninstallString }
+    if (-not $line) { return (New-UninstallCommand -Skip 'no uninstaller is registered') }
+    $parts = Split-CommandLine $line
+    $exe = $parts[0]; $args0 = [string]$parts[1]
+    # "MsiExec.exe /I{GUID}" on an entry not flagged WindowsInstaller: still an MSI, so remove it as one.
+    if ((Split-Path $exe -Leaf) -match '^(?i)msiexec(\.exe)?$') {
+        $g = [regex]::Match($args0, '\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}')
+        if ($g.Success) { return (New-UninstallCommand -Exe $msiexec -Arguments "/x $($g.Value) /qn /norestart" -How "msiexec /x (from the $from)") }
+        return (New-UninstallCommand -Skip "an msiexec $from with no ProductCode in it: $args0")
+    }
+    if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { return (New-UninstallCommand -Fail "$exe does not exist (the uninstaller is gone, so the scrub does the work)") }
+    $engine = Get-InstallerEngine $exe
+    if ($engine -eq 'Nsis') {
+        # A bare NSIS uninstaller copies itself to %TEMP%, relaunches DETACHED and exits 0 at once, so the
+        # scrub would race the real uninstall (the agent's "DBeaver phantom", 2026-07-01). _?=<dir> runs it
+        # IN PLACE and synchronously. It must be LAST and unquoted: NSIS reads it to the end of the line.
+        $tokens = @($args0 -split '\s+' | Where-Object { $_ })
+        if (-not ($tokens -ccontains '/S')) { $args0 = ("$args0 /S").Trim() }   # case-sensitive: NSIS only knows /S
+        if ($args0 -notmatch '(^|\s)_\?=') {
+            $dir = Split-Path $exe -Parent
+            if ($loc -and (Test-Path -LiteralPath $loc -PathType Container)) { $dir = ([string]$loc).TrimEnd('\') }
+            $args0 = "$args0 _?=$dir"
+        }
+        return (New-UninstallCommand -Exe $exe -Arguments $args0 -How "NSIS, in place (from the $from)")
+    }
+    if ($from -eq 'QuietUninstallString') { return (New-UninstallCommand -Exe $exe -Arguments $args0 -How 'the QuietUninstallString') }
+    # An UninstallString: add the engine's silent switch only when it carries none (the agent's rule: never
+    # second-guess switches the vendor wrote), and complete WiX Burn's "/uninstall", which alone is interactive.
+    if (-not $args0) {
+        if ($script:EngineUninstallArgs.ContainsKey($engine)) { return (New-UninstallCommand -Exe $exe -Arguments $script:EngineUninstallArgs[$engine] -How "$engine silent switch") }
+        # Inno's uninstaller is always unins000.exe, unins001.exe ... (the agent's name rule, for a stub the markers miss).
+        if ((Split-Path $exe -Leaf) -match '^(?i)unins\d+\.exe$') { return (New-UninstallCommand -Exe $exe -Arguments $script:EngineUninstallArgs['InnoSetup'] -How 'InnoSetup silent switch (by file name)') }
+    } elseif ($engine -eq 'WixBurn' -and $args0 -match '(?i)(^|\s)[/-]uninstall\b' -and $args0 -notmatch '(?i)(^|\s)[/-](quiet|silent|passive)\b') {
+        return (New-UninstallCommand -Exe $exe -Arguments "$args0 /quiet /norestart" -How 'WixBurn silent switch')
+    }
+    $has = ''
+    if ($args0) { $has = ", which already carries: $args0" }
+    return (New-UninstallCommand -Skip "no silent switch is known for this uninstaller ($engine engine$has). Run as it is, it would wait for a click, so the scrub does the work.")
+}
+
+function Test-UninstallEntryPresent {
+    param($Target)
+    $hive = Get-Prop $Target 'entryHive'; $path = Get-Prop $Target 'entryKeyPath'
+    if (-not $hive -or -not $path) { return $false }
+    $k = Open-Key $hive $path
+    if ($k) { Close-Key $k; return $true }
+    return $false
+}
+
 function Invoke-UninstallAttempt {
-    # Level 1: the app's own uninstaller, once, silently. A broken app is EXPECTED to fail here.
+    # Level 1: the app's own uninstaller, once, silently (Get-UninstallCommand). A broken app is EXPECTED
+    # to fail here; the scrub that follows does the rest either way.
     param($Plan)
     $t = $Plan.target
-    $cmd = $null; $args2 = $null
-    if ($t.isMsi -and $t.productCode) { $cmd = Join-Path $env:SystemRoot 'System32\msiexec.exe'; $args2 = "/x $($t.productCode) /qn /norestart" }
-    elseif ($t.quietUninstallString) { $parts = Split-CommandLine $t.quietUninstallString; $cmd = $parts[0]; $args2 = $parts[1] }
-    if (-not $cmd) { return 'skipped: no silent uninstaller is registered' }
-    if (-not (Test-Path -LiteralPath $cmd)) { return "failed: $cmd does not exist (that is why this app needs Leftovers)" }
-    Write-RunLog "  level 1: $cmd $args2"
-    $sp = @{ FilePath = $cmd; PassThru = $true; WindowStyle = 'Hidden' }
-    if ($args2) { $sp.ArgumentList = $args2 }
-    $p = Start-Process @sp
-    $null = $p.Handle   # keep the handle, or ExitCode can come back empty once the process is gone
-    if (-not $p.WaitForExit(600000)) { try { $p.Kill() } catch { }; $res = 'failed: timed out after 10 minutes' }
-    else { $res = "exit $($p.ExitCode)$(switch ($p.ExitCode) { 0 { ' (uninstalled)' } 3010 { ' (uninstalled, reboot needed)' } 1605 { ' (not installed as far as Windows Installer knows)' } 1612 { ' (the installation source is gone: broken, as expected)' } default { '' } })" }
-    Add-JournalRecord @{ itemId = 0; category = 'Uninstall'; kind = 'UninstallAttempt'; op = @{ command = "$cmd $args2" }; result = 'done'; note = $res }
+    $c = Get-UninstallCommand $t
+    if ($c.Skip) { $res = "skipped: $($c.Skip)" }
+    elseif ($c.Fail) { $res = "failed: $($c.Fail)" }
+    else {
+        Write-RunLog "  level 1 ($($c.How)): $($c.Exe) $($c.Args)"
+        $sp = @{ FilePath = $c.Exe; PassThru = $true; WindowStyle = 'Hidden' }
+        if ($c.Args) { $sp.ArgumentList = $c.Args }
+        $p = Start-Process @sp
+        $null = $p.Handle   # keep the handle, or ExitCode can come back empty once the process is gone
+        if (-not $p.WaitForExit(600000)) { try { $p.Kill() } catch { }; $res = 'failed: timed out after 10 minutes' }
+        else {
+            $code = $p.ExitCode
+            $res = "exit $code$(switch ($code) { 0 { ' (uninstalled)' } 3010 { ' (uninstalled, reboot needed)' } 1605 { ' (not installed as far as Windows Installer knows)' } 1612 { ' (the installation source is gone: broken, as expected)' } default { '' } })"
+            # Some uninstallers hand off to a copy of themselves and exit early (Inno's second phase). Give a
+            # clean exit time to finish before the scrub starts, judged by the app's own uninstall entry going.
+            if (($code -eq 0 -or $code -eq 3010) -and (Test-UninstallEntryPresent $t)) {
+                $deadline = (Get-Date).AddSeconds(90)
+                while ((Get-Date) -lt $deadline -and (Test-UninstallEntryPresent $t)) { Start-Sleep -Seconds 2 }
+                if (Test-UninstallEntryPresent $t) { $res += '; its uninstall entry is still there after 90 s, so the scrub removes what is left' }
+            }
+        }
+    }
+    $cmdText = $null
+    if ($c.Exe) { $cmdText = "$($c.Exe) $($c.Args)" }
+    Add-JournalRecord @{ itemId = 0; category = 'Uninstall'; kind = 'UninstallAttempt'; op = @{ command = $cmdText; how = $c.How }; result = 'done'; note = $res }
     return $res
 }
 
@@ -3416,7 +3567,7 @@ function Invoke-PlanExecution {
     ($meta | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath (Join-Path $root 'run.json') -Encoding UTF8
     Write-PlanFiles $Plan $root | Out-Null
     Remove-OldRuns $KeepDays
-    Write-RunLog "Leftovers $script:ToolVersion - level $Level run $runId for '$($Plan.target.displayName)' on $env:COMPUTERNAME ($(@($selected).Count) item(s); backup $(if ($Backup) { 'on' } else { 'OFF' }))"
+    Write-RunLog "Kill It With Fire $script:ToolVersion - level $Level run $runId for '$($Plan.target.displayName)' on $env:COMPUTERNAME ($(@($selected).Count) item(s); backup $(if ($Backup) { 'on' } else { 'OFF' }))"
 
     $status = @{}
     $result = [ordered]@{ level = $Level; done = 0; skipped = 0; pending = 0; failed = 0; notSelected = @($Plan.items).Count - @($selected).Count; stoppedAt = $null; error = $null; uninstall = $null; backup = $(if ($Backup) { $root } else { $null }); status = $status }
@@ -3482,7 +3633,7 @@ function Remove-OldRuns {
         if ($age.TotalDays -lt $Days) { continue }
         Remove-TreeLongPath (Join-Path (Get-RunsRoot) $r.runId)
         foreach ($d in [System.IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady }) {
-            $q = [System.IO.Path]::Combine($d.RootDirectory.FullName, '.leftovers', [string]$r.runId)
+            $q = [System.IO.Path]::Combine($d.RootDirectory.FullName, '.killitwithfire', [string]$r.runId)
             if (Test-Path -LiteralPath $q) { Remove-TreeLongPath $q }
         }
         Write-RunLog "  purged run $($r.runId) ($($r.app), $([int]$age.TotalDays) days old)"
@@ -3522,7 +3673,7 @@ function Invoke-RegImport {
     if ($o.Code -ne 0) { throw "reg import $File failed: $($o.Output)" }
 }
 
-function Invoke-LeftoversRestore {
+function Invoke-KillItWithFireRestore {
     param([string] $RunId, [bool] $Confirmed)
     $root = Join-Path (Get-RunsRoot) $RunId
     $metaFile = Join-Path $root 'run.json'
@@ -3627,7 +3778,7 @@ function Invoke-LeftoversRestore {
                         $deps = @(Get-Prop $r 'dependOnService' | Where-Object { $_ })
                         $account = [string](Get-Prop $r 'objectName')
                         $isDrv = ([int](Get-Prop $r 'typeOriginal') -band 0xB) -ne 0
-                        $code = [Leftovers.Native]::CreateServiceRaw($name, $(if (Get-Prop $r 'displayName') { [string]$r.displayName } else { $name }),
+                        $code = [KillItWithFire.Native]::CreateServiceRaw($name, $(if (Get-Prop $r 'displayName') { [string]$r.displayName } else { $name }),
                             [uint32](Get-Prop $r 'typeOriginal'), [uint32](Get-Prop $r 'startOriginal'), [uint32](Get-Prop $r 'errorControl'), [string](Get-Prop $r 'imageRaw'),
                             $(if (Get-Prop $r 'group') { [string]$r.group } else { [NullString]::Value }),
                             $(if ($deps.Count) { ($deps -join [char]0) + [char]0 } else { [NullString]::Value }),
@@ -3745,7 +3896,7 @@ function Test-NetComponentPresent {
     return $false
 }
 
-function Invoke-LeftoversResume {
+function Invoke-KillItWithFireResume {
     # After the reboot a run asked for: check that every pending change happened.
     param([string] $RunId)
     $root = Join-Path (Get-RunsRoot) $RunId
@@ -3873,9 +4024,9 @@ function Get-GuiGroups {
     return $rows
 }
 
-function New-LeftoversForm {
+function New-KillItWithFireForm {
     # Builds the window and wires everything that only changes the window itself (levels, options,
-    # checklist, command line). Actions that run the engine are wired by Show-LeftoversGui.
+    # checklist, command line). Actions that run the engine are wired by Show-KillItWithFireGui.
     param($Policy, [string] $PlanFile)
     Add-Type -AssemblyName System.Windows.Forms, System.Drawing
     [System.Windows.Forms.Application]::EnableVisualStyles()
@@ -3884,16 +4035,16 @@ function New-LeftoversForm {
     try { [System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException) } catch { }
     [System.Windows.Forms.Application]::add_ThreadException({
             param($s, $e)
-            $log = Join-Path ([System.IO.Path]::GetTempPath()) 'leftovers-window-error.log'
+            $log = Join-Path ([System.IO.Path]::GetTempPath()) 'killitwithfire-window-error.log'
             $pos = ''
             try { $pos = [string]$e.Exception.ErrorRecord.InvocationInfo.PositionMessage } catch { }
             try { Add-Content -LiteralPath $log -Value ("{0}  {1}`r`n{2}`r`n{3}`r`n" -f (Get-Date -Format s), $e.Exception.Message, $pos, $e.Exception.StackTrace) } catch { }
-            [void][System.Windows.Forms.MessageBox]::Show("Something went wrong in the window: $($e.Exception.Message)`n`nDetails: $log", 'Leftovers', 'OK', 'Error')
+            [void][System.Windows.Forms.MessageBox]::Show("Something went wrong in the window: $($e.Exception.Message)`n`nDetails: $log", 'Kill It With Fire', 'OK', 'Error')
         })
     $ui = @{ Plan = $null; PlanFile = $null; App = $null; Unchecked = @{}; Loading = $false; Policy = $Policy }
     $bold = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
     $f = New-Object System.Windows.Forms.Form
-    $f.Text = 'Leftovers - clean up an app whose uninstall is broken'
+    $f.Text = 'Kill It With Fire - clean up an app whose uninstall is broken'
     # Fits a 1024x768 screen: the buttons live in a bar docked at the bottom and the rest scrolls, so
     # Clean up / Restore / Close are never off-screen (they were, on the lab VM).
     $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
@@ -3954,11 +4105,15 @@ function New-LeftoversForm {
     $chkUser = New-Object System.Windows.Forms.CheckBox; $chkUser.Text = 'Include user &data (AppData)'; $chkUser.Location = '12,52'; $chkUser.AutoSize = $true
     $chkReview = New-Object System.Windows.Forms.CheckBox; $chkReview.Text = 'Include items that need revie&w'; $chkReview.Location = '330,52'; $chkReview.AutoSize = $true
     $tip.SetToolTip($chkReview, 'Items tied to the app only by vendor name, signer, or one MSI claim on a Windows file.')
-    $chkUninst = New-Object System.Windows.Forms.CheckBox; $chkUninst.Text = "Run the app's own u&ninstaller first (level 1 and up)"; $chkUninst.Location = '12,78'; $chkUninst.AutoSize = $true; $chkUninst.Checked = $true
-    $tip.SetToolTip($chkUninst, 'Off = -SkipUninstall: go straight to the cleanup (the uninstaller is known to be broken, or it would undo a working app).')
+    # KILL IT (2026-10-03): the hard way as its own, unmissable choice. Off (the default) is the proper way:
+    # the app's own uninstaller runs first. On is -KillIt: no uninstaller, the level jumps to Full scrub, and
+    # the Clean up button says "Kill it" so nobody does it by accident.
+    $chkUninst = New-Object System.Windows.Forms.CheckBox; $chkUninst.Text = "&KILL IT: skip the app's own uninstaller and scrub it out"; $chkUninst.Location = '12,78'; $chkUninst.AutoSize = $true; $chkUninst.Checked = $false
+    $chkUninst.Font = $bold; $chkUninst.ForeColor = [System.Drawing.Color]::DarkRed
+    $tip.SetToolTip($chkUninst, "Off = the proper way: the app's own uninstaller runs first, then the cleanup. On = -KillIt: no uninstaller, straight to the full scrub. It still backs everything up, so Restore can undo it.")
     $lblPolicy = New-Object System.Windows.Forms.Label; $lblPolicy.Location = '12,100'; $lblPolicy.Size = '796,18'; $lblPolicy.ForeColor = [System.Drawing.Color]::DarkRed; $lblPolicy.Anchor = 'Top,Left,Right'
     foreach ($c in @($chkBackup, $chkLog, $txtLog, $chkUser, $chkReview, $chkUninst, $lblPolicy)) { $grpOpt.Controls.Add($c) }
-    $ui.Backup = $chkBackup; $ui.LogCheck = $chkLog; $ui.LogPath = $txtLog; $ui.UserData = $chkUser; $ui.Review = $chkReview; $ui.Uninstall = $chkUninst; $ui.PolicyLabel = $lblPolicy
+    $ui.Backup = $chkBackup; $ui.LogCheck = $chkLog; $ui.LogPath = $txtLog; $ui.UserData = $chkUser; $ui.Review = $chkReview; $ui.KillIt = $chkUninst; $ui.PolicyLabel = $lblPolicy
 
     # The same run as a command line
     $lblCmd = New-Object System.Windows.Forms.Label; $lblCmd.Text = 'The same run from a command line (RMM, PDQ, Intune):'; $lblCmd.Location = '12,676'; $lblCmd.AutoSize = $true
@@ -3985,6 +4140,10 @@ function New-LeftoversForm {
     if ($null -ne $Policy.MaxLevel) {
         for ($i = 0; $i -le 3; $i++) { if ($i -gt [int]$Policy.MaxLevel) { $levels[$i].Enabled = $false; $tip.SetToolTip($levels[$i], 'Set by your administrator') } }
         $locks += "highest level $($Policy.MaxLevel)"
+        # KILL IT selects Full scrub, and .Checked on a DISABLED radio still works from code: without this
+        # the box would walk straight past the lock (the engine would still refuse the run, but the window
+        # must not offer what the administrator took away).
+        if ([int]$Policy.MaxLevel -lt 3) { $chkUninst.Enabled = $false; $tip.SetToolTip($chkUninst, 'Set by your administrator (KILL IT is a full scrub)') }
     }
     if ($Policy.RequireBackup) { $chkBackup.Checked = $true; $chkBackup.Enabled = $false; $tip.SetToolTip($chkBackup, 'Set by your administrator'); $locks += 'backup required' }
     if ($Policy.RequireLog) { $chkLog.Checked = $true; $chkLog.Enabled = $false; $tip.SetToolTip($chkLog, 'Set by your administrator'); $locks += 'log required' }
@@ -4002,8 +4161,8 @@ function New-LeftoversForm {
         $appName = if ($ui.App) { $ui.App.DisplayName } elseif ($ui.Plan) { $ui.Plan.target.displayName } else { '<app>' }
         $pcode = if ($ui.App -and $ui.App.ProductCode -and $ui.App.IsMsi) { $ui.App.ProductCode } elseif (-not $ui.App -and $ui.Plan -and $ui.Plan.target.productCode -and (Get-Prop $ui.Plan.target 'isMsi')) { $ui.Plan.target.productCode } else { $null }
         $ui.Command.Text = Format-CommandLine -AppName $appName -ProductCode $pcode -Level $lvl -Exclude $exclude -IncludeUserData $ui.UserData.Checked -IncludeReview $ui.Review.Checked `
-            -NoBackup (-not $ui.Backup.Checked) -NoLog (-not $ui.LogCheck.Checked) -LogPath $ui.LogPath.Text -SkipUninstall (-not $ui.Uninstall.Checked)
-        $ui.Uninstall.Enabled = ($lvl -ge 1)
+            -NoBackup (-not $ui.Backup.Checked) -NoLog (-not $ui.LogCheck.Checked) -LogPath $ui.LogPath.Text -SkipUninstall $ui.KillIt.Checked
+        $ui.Clean.Text = $(if ($ui.KillIt.Checked) { '&Kill it' } else { '&Clean up' })
         $ui.LogPath.Enabled = $ui.LogCheck.Checked -and -not $ui.Policy.LogPath
         $ui.Clean.Enabled = [bool]($ui.Plan -and $lvl -ge 1)
     }
@@ -4042,8 +4201,19 @@ function New-LeftoversForm {
         $ui.Status.Text = "Scan of '$($PlanObject.target.displayName)': $(@($PlanObject.items).Count) item(s). Nothing has been changed."
     }
 
-    foreach ($rb in $levels) { $rb.Add_CheckedChanged({ if ($this.Checked) { & $ui.Rebuild } }) }
-    foreach ($c in @($chkBackup, $chkLog, $chkUser, $chkReview, $chkUninst)) { $c.Add_CheckedChanged({ & $ui.UpdateCommand }) }
+    foreach ($rb in $levels) {
+        $rb.Add_CheckedChanged({
+                if (-not $this.Checked) { return }
+                # Below registration cleanup there is nothing to kill: KILL IT only means something at 2 and 3.
+                if ([int]$this.Tag -lt 2 -and $ui.KillIt.Checked) { $ui.KillIt.Checked = $false }
+                & $ui.Rebuild
+            })
+    }
+    foreach ($c in @($chkBackup, $chkLog, $chkUser, $chkReview)) { $c.Add_CheckedChanged({ & $ui.UpdateCommand }) }
+    $chkUninst.Add_CheckedChanged({
+            # KILL IT goes all the way: tick it and the level moves to Full scrub (the level handler rebuilds).
+            if ($ui.KillIt.Checked -and (& $ui.GetLevel) -lt 3) { $ui.Levels[3].Checked = $true } else { & $ui.UpdateCommand }
+        })
     $txtLog.Add_TextChanged({ & $ui.UpdateCommand })
     $cats.Add_ItemCheck({
             if ($ui.Loading) { return }
@@ -4079,7 +4249,7 @@ function Show-TextDialog {
     $d.Dispose()
 }
 
-function Start-LeftoversChild {
+function Start-KillItWithFireChild {
     # The window's work runs as a child process of this same script: same engine, same switches. No
     # console at all (CreateNoWindow): on Windows 11 a hidden-window child still opened in Windows
     # Terminal, on top of the form, and took the keystrokes (lab 2026-09-26). Output comes back through
@@ -4096,9 +4266,9 @@ function Start-LeftoversChild {
     return [System.Diagnostics.Process]::Start($psi)
 }
 
-function Show-LeftoversGui {
+function Show-KillItWithFireGui {
     param($Policy)
-    $ui = New-LeftoversForm -Policy $Policy
+    $ui = New-KillItWithFireForm -Policy $Policy
     # The window's scans live in the admin-only folder, not %TEMP%: the plan a scan writes is what Clean up
     # then executes elevated, and the user's own non-elevated programs can write to %TEMP% (review 2026-09-26).
     $guiRoot = Join-Path (Split-Path (Get-RunsRoot) -Parent) 'gui'
@@ -4144,7 +4314,7 @@ function Show-LeftoversGui {
         if ($state.Kind -eq 'Scan') {
             $pf = Join-Path $state.Dir 'plan.json'
             if ($code -eq 0 -and (Test-Path -LiteralPath $pf)) { $ui.PlanFile = $pf; & $ui.LoadPlan (Get-Content -LiteralPath $pf -Raw -Encoding UTF8 | ConvertFrom-Json) }
-            else { $ui.Status.Text = "Scan stopped (exit $code)."; Show-TextDialog 'Leftovers: scan' $output $ui.Form }
+            else { $ui.Status.Text = "Scan stopped (exit $code)."; Show-TextDialog 'Kill It With Fire: scan' $output $ui.Form }
         } else {
             # By kind: a restore's 3010 means "reboot and it's in effect" and its 1 means "not finished, run
             # Restore again"; only a cleanup's 3010 goes on to Resume (review 2026-09-29).
@@ -4154,7 +4324,7 @@ function Show-LeftoversGui {
                 switch ($code) { 0 { 'done' } 3010 { 'done; reboot, then Resume' } 1 { 'stopped part way; the run can be restored' } 2 { 'refused' } default { 'stopped on an error' } }
             }
             $ui.Status.Text = "$($state.Kind) finished: exit $code ($meaning)."
-            Show-TextDialog "Leftovers: $($state.Kind) (exit $code, $meaning)" $output $ui.Form
+            Show-TextDialog "Kill It With Fire: $($state.Kind) (exit $code, $meaning)" $output $ui.Form
             if ($state.Kind -ne 'Restore') { $ui.Plan = $null; $ui.PlanFile = $null; & $ui.Rebuild }
         }
     }
@@ -4177,7 +4347,7 @@ function Show-LeftoversGui {
     $ui.Form.Add_FormClosing({
             if ($state.Proc -and -not $state.Proc.HasExited) {
                 $_.Cancel = $true
-                [void][System.Windows.Forms.MessageBox]::Show("The $($state.Kind.ToLowerInvariant()) is still running. Wait for it to finish: closing now would leave it running with nobody watching.", 'Leftovers', 'OK', 'Warning')
+                [void][System.Windows.Forms.MessageBox]::Show("The $($state.Kind.ToLowerInvariant()) is still running. Wait for it to finish: closing now would leave it running with nobody watching.", 'Kill It With Fire', 'OK', 'Warning')
             }
         })
     $launch = {
@@ -4185,14 +4355,14 @@ function Show-LeftoversGui {
         $state.Kind = $Kind; $state.Dir = Join-Path $work ([guid]::NewGuid().ToString('N').Substring(0, 8)); [void](New-Item -ItemType Directory -Force -Path $state.Dir)
         $state.Started = Get-Date; $state.Last = ''
         foreach ($b in @($ui.Scan, $ui.Restore, $ui.Clean)) { $b.Enabled = $false }
-        $state.Proc = Start-LeftoversChild -Arguments ($ArgList + @('-OutDir', $state.Dir))
+        $state.Proc = Start-KillItWithFireChild -Arguments ($ArgList + @('-OutDir', $state.Dir))
         $state.Lines = New-Object System.Text.StringBuilder
         $state.Read = $state.Proc.StandardOutput.ReadLineAsync()
         $state.Err = $state.Proc.StandardError.ReadToEndAsync()
         $timer.Start()
     }
     $ui.Scan.Add_Click({
-            if (-not $ui.App) { [void][System.Windows.Forms.MessageBox]::Show('Pick an app first.', 'Leftovers'); return }
+            if (-not $ui.App) { [void][System.Windows.Forms.MessageBox]::Show('Pick an app first.', 'Kill It With Fire'); return }
             $a = if ($ui.App.ProductCode -and $ui.App.IsMsi) { @('-ProductCode', $ui.App.ProductCode) } else { @('-Name', $ui.App.DisplayName) }
             & $launch 'Scan' ($a + @('-Level', '0'))
         })
@@ -4217,13 +4387,13 @@ function Show-LeftoversGui {
             $keep = @($present | Where-Object { -not $ui.Unchecked.ContainsKey($_) })
             $msg = "Level $lvl ($(@('scan only', 'uninstall', 'registration cleanup', 'full scrub')[$lvl])) on '$($ui.Plan.target.displayName)'.`n`n"
             if ($lvl -ge 2) { $msg += "Categories: $(if ($keep.Count) { $keep -join ', ' } else { '(none)' })`n" }
-            $msg += "The app's own uninstaller: $(if ($ui.Uninstall.Checked) { 'runs first' } else { 'skipped' })`n"
+            $msg += "The app's own uninstaller: $(if ($ui.KillIt.Checked) { 'SKIPPED - KILL IT scrubs the app out without it' } else { 'runs first' })`n"
             $msg += "Backup: $(if ($ui.Backup.Checked) { 'yes, a restore can undo it' } else { 'NO - this run cannot be restored' })`n`nContinue?"
-            if ([System.Windows.Forms.MessageBox]::Show($msg, 'Leftovers', 'YesNo', 'Warning') -ne 'Yes') { return }
+            if ([System.Windows.Forms.MessageBox]::Show($msg, 'Kill It With Fire', 'YesNo', 'Warning') -ne 'Yes') { return }
             $a = @('-Plan', $ui.PlanFile, '-Level', [string]$lvl, '-Force')
             if ($lvl -ge 2 -and $exclude.Count) { $a += @('-Exclude', ($exclude -join ',')) }
             if ($ui.UserData.Checked) { $a += '-IncludeUserData' }; if ($ui.Review.Checked) { $a += '-IncludeReview' }
-            if (-not $ui.Uninstall.Checked) { $a += '-SkipUninstall' }
+            if ($ui.KillIt.Checked) { $a += '-SkipUninstall' }
             if (-not $ui.Backup.Checked) { $a += '-NoBackup' }
             if (-not $ui.LogCheck.Checked) { $a += '-NoLog' } elseif ($ui.LogPath.Text -and -not $ui.Policy.LogPath) { $a += @('-Log', $ui.LogPath.Text) }
             & $launch 'Clean up' $a
@@ -4248,7 +4418,7 @@ function Show-LeftoversGui {
             $dlg.Controls.Add($lv); $dlg.Controls.Add($note); $dlg.Controls.Add($go); $dlg.AcceptButton = $go
             if ($dlg.ShowDialog($ui.Form) -eq 'OK' -and $lv.SelectedItems.Count) {
                 $r = $lv.SelectedItems[0].Tag
-                if ([System.Windows.Forms.MessageBox]::Show("Put back everything run $($r.runId) changed ($($r.app))?", 'Leftovers', 'YesNo', 'Question') -eq 'Yes') { & $launch 'Restore' @('-Restore', [string]$r.runId, '-Force') }
+                if ([System.Windows.Forms.MessageBox]::Show("Put back everything run $($r.runId) changed ($($r.app))?", 'Kill It With Fire', 'YesNo', 'Question') -eq 'Yes') { & $launch 'Restore' @('-Restore', [string]$r.runId, '-Force') }
             }
             $dlg.Dispose()
         })
@@ -4264,7 +4434,7 @@ function Invoke-GuiSelfTest {
     # how the tests prove the administrator locks, the checklist and the command line without a person
     # at the screen. -Plan loads a plan; the highest level the policy allows is selected.
     param($Policy, [string] $PngPath, [string] $PlanFile)
-    $ui = New-LeftoversForm -Policy $Policy -PlanFile $PlanFile
+    $ui = New-KillItWithFireForm -Policy $Policy -PlanFile $PlanFile
     # Shown off-screen: a form that was never shown has no child windows, and DrawToBitmap then renders
     # an empty frame (the first self-test PNG was exactly that).
     $ui.Form.StartPosition = 'Manual'
@@ -4285,9 +4455,22 @@ function Invoke-GuiSelfTest {
         level = (& $ui.GetLevel); levelsEnabled = @($ui.Levels | ForEach-Object { $_.Enabled }); levelText = $ui.LevelText.Text
         backupChecked = $ui.Backup.Checked; backupEnabled = $ui.Backup.Enabled
         logChecked = $ui.LogCheck.Checked; logEnabled = $ui.LogCheck.Enabled; logPath = $ui.LogPath.Text; logPathEnabled = $ui.LogPath.Enabled
-        uninstallChecked = $ui.Uninstall.Checked; userDataEnabled = $ui.UserData.Enabled; userDataText = $ui.UserData.Text; reviewText = $ui.Review.Text; policyLabel = $ui.PolicyLabel.Text
+        killItChecked = $ui.KillIt.Checked; cleanText = $ui.Clean.Text; userDataEnabled = $ui.UserData.Enabled; userDataText = $ui.UserData.Text; reviewText = $ui.Review.Text; policyLabel = $ui.PolicyLabel.Text
         categories = @($ui.Categories.Items | ForEach-Object { [string]$_ }); categoriesEnabled = $ui.Categories.Enabled; description = $ui.Description.Text
-        command = $ui.Command.Text; cleanEnabled = $ui.Clean.Enabled
+        command = $ui.Command.Text; cleanEnabled = $ui.Clean.Enabled; killItEnabled = $ui.KillIt.Enabled; killIt = $null
+    }
+    # The KILL IT wiring: from Scan only, ticking it must jump to Full scrub, say -KillIt, and relabel the
+    # button; dropping back to level 1 must untick it (there is nothing to kill there).
+    if ($ui.Plan -and $ui.KillIt.Enabled) {
+        $ui.Levels[0].Checked = $true
+        $ui.KillIt.Checked = $true
+        [System.Windows.Forms.Application]::DoEvents()
+        $k = [ordered]@{ level = (& $ui.GetLevel); command = $ui.Command.Text; cleanText = $ui.Clean.Text }
+        $ui.Levels[1].Checked = $true
+        [System.Windows.Forms.Application]::DoEvents()
+        $k.checkedAfterLevel1 = $ui.KillIt.Checked
+        $k.cleanTextAfterLevel1 = $ui.Clean.Text
+        $stateOut.killIt = $k
     }
     $ui.Form.Close()
     $ui.Form.Dispose()
@@ -4309,18 +4492,18 @@ function Test-Elevated {
 function Invoke-Main {
     param([string] $Mode)
     $ErrorActionPreference = 'Stop'
-    if ($PolicyFile -and $Mode -ne 'GuiSelfTest') { Write-Host '-PolicyFile is for the window self-test only. Policy comes from HKLM\SOFTWARE\Policies\Leftovers.'; return 3 }
-    $policy = Get-LeftoversPolicy -Json $(if ($PolicyFile) { Get-Content -LiteralPath $PolicyFile -Raw } else { $null })
+    if ($PolicyFile -and $Mode -ne 'GuiSelfTest') { Write-Host '-PolicyFile is for the window self-test only. Policy comes from HKLM\SOFTWARE\Policies\KillItWithFire.'; return 3 }
+    $policy = Get-KillItWithFirePolicy -Json $(if ($PolicyFile) { Get-Content -LiteralPath $PolicyFile -Raw } else { $null })
     $say = { param($m) if (-not $Quiet) { Write-Host $m } }
     $keepDays = if ($null -ne $policy.QuarantineDays) { [int]$policy.QuarantineDays } elseif ($QuarantineDays -gt 0) { $QuarantineDays } else { 14 }
 
     if ($Mode -eq 'GuiSelfTest') { return (Invoke-GuiSelfTest -Policy $policy -PngPath $GuiSelfTest -PlanFile $Plan) }
     if (-not (Test-Elevated)) {
-        Write-Host 'Leftovers must run elevated (admin or SYSTEM). A non-elevated scan misses services, tasks and other users, and a partial report would read like a complete one.'
+        Write-Host 'Kill It With Fire must run elevated (admin or SYSTEM). A non-elevated scan misses services, tasks and other users, and a partial report would read like a complete one.'
         return 3
     }
     Initialize-RegistryBase
-    if ($Mode -eq 'Gui') { return (Show-LeftoversGui -Policy $policy) }
+    if ($Mode -eq 'Gui') { return (Show-KillItWithFireGui -Policy $policy) }
     if ($Mode -eq 'List') {
         $entries = Get-UninstallEntries (Get-LoadedUserSids)
         $rows = $entries | Where-Object { $_.DisplayName } | Sort-Object DisplayName, DisplayVersion |
@@ -4336,16 +4519,23 @@ function Invoke-Main {
         $runs | Select-Object runId, app, level, items, status, backup, started | Format-Table -AutoSize | Out-String -Width 300 | Write-Host
         return 0
     }
-    if ($Mode -eq 'Restore') { return (Invoke-LeftoversRestore -RunId $Restore -Confirmed ([bool]$Force)) }
-    if ($Mode -eq 'Resume') { return (Invoke-LeftoversResume -RunId $Resume) }
+    if ($Mode -eq 'Restore') { return (Invoke-KillItWithFireRestore -RunId $Restore -Confirmed ([bool]$Force)) }
+    if ($Mode -eq 'Resume') { return (Invoke-KillItWithFireResume -RunId $Resume) }
 
     # ---------------------------------------------------------------- Run: scan, then (level 1+) execute
+    # -KillIt is the hard way on purpose: no uninstaller, straight to the level 3 scrub. It is ONLY a
+    # shorthand: the protected list, the refusals, the policy's MaxLevel and the backup all apply exactly
+    # as they do to "-Level 3 -SkipUninstall", so it can never reach anything that pair could not.
+    $resolved = Resolve-RunLevel -Level $Level -KillIt ([bool]$KillIt) -SkipUninstall ([bool]$SkipUninstall)
+    if ($resolved.Error) { Write-Host $resolved.Error; return 3 }
+    $Level = $resolved.Level
+    $SkipUninstall = $resolved.SkipUninstall
     $inc = @($Include | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     $exc = @($Exclude | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     foreach ($g in $inc + $exc) { if (-not $script:Categories.Contains($g)) { Write-Host "Unknown category '$g'. Categories: $($script:Categories.Keys -join ', ')"; return 3 } }
     $logFile = $null
     $violations = @(Get-PolicyViolations -Policy $policy -Level $Level -NoBackup ([bool]$NoBackup) -NoLog ([bool]$NoLog) -LogPath $Log -IncludeUserData ([bool]$IncludeUserData -or $inc -contains 'UserData') -QuarantineDays $QuarantineDays)
-    if ($violations.Count) { Write-Host 'Refused by policy (HKLM\SOFTWARE\Policies\Leftovers):'; foreach ($v in $violations) { Write-Host "  - $v" }; return 2 }
+    if ($violations.Count) { Write-Host 'Refused by policy (HKLM\SOFTWARE\Policies\KillItWithFire):'; foreach ($v in $violations) { Write-Host "  - $v" }; return 2 }
 
     $planObj = $null
     if ($Plan) {
@@ -4363,7 +4553,7 @@ function Invoke-Main {
         if ($given -ne 1) { Write-Host 'Name the app with exactly one of -Name, -ProductCode, -UpgradeCode (or -Plan). -List shows names.'; return 3 }
         # (A relaunched copy receives a list as one comma-joined argument.)
         try { $appProfiles = @(Import-AppProfile -Extra @($ProfilePath | ForEach-Object { $_ -split ',' } | Where-Object { $_ })) } catch { Write-Host "Profile error: $($_.Exception.Message)"; return 3 }
-        $built = New-LeftoversPlan -AppName $Name -AppProductCode $ProductCode -AppUpgradeCode $UpgradeCode -AppKeyword $Keyword -Say $say -AppProfiles $appProfiles
+        $built = New-KillItWithFirePlan -AppName $Name -AppProductCode $ProductCode -AppUpgradeCode $UpgradeCode -AppKeyword $Keyword -Say $say -AppProfiles $appProfiles
         if ($built.Code -ne 0) {
             Write-Host $built.Message
             if ($built.ContainsKey('Near') -and $built.Near) { Write-Host 'Close matches:'; foreach ($n in $built.Near) { Write-Host "  $n" } }
@@ -4382,7 +4572,7 @@ function Invoke-Main {
     }
 
     $logFile = if ($NoLog) { $null } elseif ($policy.LogPath) { $policy.LogPath } elseif ($Log) { $Log } else { Join-Path (Join-Path (Get-RunsRoot) $planObj.runId) 'log.txt' }
-    if ($logFile -and ((Test-Path -LiteralPath $logFile -PathType Container) -or $logFile.EndsWith('\'))) { $logFile = Join-Path $logFile "leftovers-$($planObj.runId)-$env:COMPUTERNAME.log" }
+    if ($logFile -and ((Test-Path -LiteralPath $logFile -PathType Container) -or $logFile.EndsWith('\'))) { $logFile = Join-Path $logFile "killitwithfire-$($planObj.runId)-$env:COMPUTERNAME.log" }
     if ($logFile) { $ld = Split-Path $logFile -Parent; if ($ld -and -not (Test-Path -LiteralPath $ld)) { [void](New-Item -ItemType Directory -Force -Path $ld) } }
     $selected = Select-PlanItems $planObj $Level $inc $exc ([bool]$IncludeUserData) ([bool]$IncludeReview)
     if (-not $Force) {
@@ -4398,7 +4588,7 @@ function Invoke-Main {
     $runDir = Join-Path (Get-RunsRoot) $planObj.runId
     if (-not $Quiet) { Write-Host ''; Write-Host (Get-Content -LiteralPath (Join-Path $runDir 'report.txt') -Raw) }
     if ($result.failed) { return 1 }
-    if ($result.pending) { Write-Host "A reboot is needed. After it, run: .\Leftovers.ps1 -Resume $($planObj.runId)"; return 3010 }
+    if ($result.pending) { Write-Host "A reboot is needed. After it, run: .\KillItWithFire.ps1 -Resume $($planObj.runId)"; return 3010 }
     return 0
 }
 
@@ -4423,7 +4613,7 @@ if (-not $LibraryOnly) {
         if (Test-Path -LiteralPath $native) {
             exit (Invoke-SelfRelaunch -Exe $native -HostArgs @('-NoProfile', '-ExecutionPolicy', 'Bypass') -ScriptArgs $relaunchArgs)
         }
-        Write-Host 'Leftovers must run in 64-bit PowerShell on 64-bit Windows.'
+        Write-Host 'Kill It With Fire must run in 64-bit PowerShell on 64-bit Windows.'
         exit 3
     }
     if ($mode -eq 'Gui') {
@@ -4431,13 +4621,13 @@ if (-not $LibraryOnly) {
         # would otherwise hang forever on an invisible dialog.
         $me = [Security.Principal.WindowsIdentity]::GetCurrent()
         if (-not [Environment]::UserInteractive -or $me.IsSystem) {
-            Write-Host 'No arguments: nothing to do in a non-interactive session. Name the app (-Name, -ProductCode, -UpgradeCode), or -List. Get-Help .\Leftovers.ps1 -Full shows every switch.'
+            Write-Host 'No arguments: nothing to do in a non-interactive session. Name the app (-Name, -ProductCode, -UpgradeCode), or -List. Get-Help .\KillItWithFire.ps1 -Full shows every switch.'
             exit 3
         }
         if (-not (Test-Elevated)) {
             # Double-clicked by an admin without elevation: ask for it (UAC) instead of failing.
             try { Start-Process -FilePath (Get-PowerShellExe) -Verb RunAs -ArgumentList ((@('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath) | ForEach-Object { ConvertTo-ArgvString $_ }) -join ' ') | Out-Null; exit 0 }
-            catch { Write-Host 'Leftovers needs to run as an administrator.'; exit 3 }
+            catch { Write-Host 'Kill It With Fire needs to run as an administrator.'; exit 3 }
         }
         # The window needs a single-threaded apartment (message loop, dialogs).
         if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
@@ -4447,7 +4637,7 @@ if (-not $LibraryOnly) {
     try {
         $code = Invoke-Main -Mode $mode
     } catch {
-        Write-Host "Leftovers stopped on an unexpected error: $($_.Exception.Message) (line $($_.InvocationInfo.ScriptLineNumber))"
+        Write-Host "Kill It With Fire stopped on an unexpected error: $($_.Exception.Message) (line $($_.InvocationInfo.ScriptLineNumber))"
         if ($script:Run) { Write-Host "Changes made before the error are in the journal: -Restore $($script:Run.RunId)" }
         $code = 4
     }

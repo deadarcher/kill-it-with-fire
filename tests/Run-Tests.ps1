@@ -1,10 +1,10 @@
-# Unit tests for Leftovers' pure helpers, plus one read-only check against the real registry.
+# Unit tests for Kill It With Fire's pure helpers, plus one read-only check against the real registry.
 # No Pester dependency (Windows ships Pester 3.4, CI can use anything): runs on Windows PowerShell 5.1
 # and PowerShell 7. Exit code 0 = all passed.
 #   powershell -NoProfile -File tests\Run-Tests.ps1
 #   pwsh -NoProfile -File tests\Run-Tests.ps1
 $ErrorActionPreference = 'Stop'
-. (Join-Path $PSScriptRoot '..\Leftovers.ps1') -LibraryOnly
+. (Join-Path $PSScriptRoot '..\KillItWithFire.ps1') -LibraryOnly
 
 $script:pass = 0
 $script:fail = 0
@@ -118,7 +118,7 @@ Assert-Equal $true (Test-IsMicrosoftName 'Microsoft Corporation') 'Microsoft'
 Assert-Equal $false (Test-IsMicrosoftName 'Microsofty Ltd') 'Microsofty is not Microsoft'
 
 # ---- user-data tagging (temp fixture, removed afterwards)
-$tmp = Join-Path ([System.IO.Path]::GetTempPath()) ('leftovers-test-' + [guid]::NewGuid().ToString('N'))
+$tmp = Join-Path ([System.IO.Path]::GetTempPath()) ('killitwithfire-test-' + [guid]::NewGuid().ToString('N'))
 try {
     New-Item -ItemType Directory -Path (Join-Path $tmp 'cache') -Force | Out-Null
     Set-Content -LiteralPath (Join-Path $tmp 'cache\blob.bin') -Value 'x'
@@ -165,9 +165,70 @@ $sp = Split-CommandLine '"C:\Program Files\App\unins000.exe" /SILENT /NORESTART'
 Assert-Equal 'C:\Program Files\App\unins000.exe|/SILENT /NORESTART' ($sp -join '|') 'split a quoted uninstall command'
 $sp = Split-CommandLine 'C:\Program Files\App\uninstall.exe /S'
 Assert-Equal 'C:\Program Files\App\uninstall.exe|/S' ($sp -join '|') 'split an unquoted uninstall command'
-Assert-Equal ".\Leftovers.ps1 -ProductCode '{DDC95F26-92B1-4546-9678-5DC68DF76BA0}' -Level 3 -Exclude Drivers,Files -IncludeReview -Log '\\srv\logs\' -Force" `
+Assert-Equal ".\KillItWithFire.ps1 -ProductCode '{DDC95F26-92B1-4546-9678-5DC68DF76BA0}' -Level 3 -Exclude Drivers,Files -IncludeReview -Log '\\srv\logs\' -Force" `
     (Format-CommandLine -AppName 'x' -ProductCode '{DDC95F26-92B1-4546-9678-5DC68DF76BA0}' -Level 3 -Exclude @('Drivers', 'Files') -IncludeUserData $false -IncludeReview $true -NoBackup $false -NoLog $false -LogPath '\\srv\logs\') 'command line for the window'
-Assert-Equal ".\Leftovers.ps1 -Name 'Bob''s App' -Level 0" (Format-CommandLine -AppName "Bob's App" -Level 0 -IncludeUserData $false -IncludeReview $false -NoBackup $false -NoLog $false) 'scan command, quote escaped, no -Force'
+Assert-Equal ".\KillItWithFire.ps1 -Name 'Bob''s App' -Level 0" (Format-CommandLine -AppName "Bob's App" -Level 0 -IncludeUserData $false -IncludeReview $false -NoBackup $false -NoLog $false) 'scan command, quote escaped, no -Force'
+Assert-Equal ".\KillItWithFire.ps1 -Name 'x' -KillIt -Force" (Format-CommandLine -AppName 'x' -Level 3 -IncludeUserData $false -IncludeReview $false -NoBackup $false -NoLog $false -SkipUninstall $true) 'level 3 without the uninstaller reads as -KillIt'
+Assert-Equal ".\KillItWithFire.ps1 -Name 'x' -Level 2 -SkipUninstall -Force" (Format-CommandLine -AppName 'x' -Level 2 -IncludeUserData $false -IncludeReview $false -NoBackup $false -NoLog $false -SkipUninstall $true) 'level 2 without the uninstaller stays -SkipUninstall'
+
+# ---- -KillIt is exactly "-Level 3 -SkipUninstall", and contradicting levels are refused
+$r = Resolve-RunLevel -Level 0 -KillIt $true -SkipUninstall $false
+Assert-Equal '3|True' "$($r.Level)|$($r.SkipUninstall)" '-KillIt alone: level 3, no uninstaller'
+$r = Resolve-RunLevel -Level 3 -KillIt $true -SkipUninstall $false
+Assert-Equal '3|True' "$($r.Level)|$($r.SkipUninstall)" '-KillIt with -Level 3 is the same'
+Assert-Equal $true ([bool](Resolve-RunLevel -Level 1 -KillIt $true -SkipUninstall $false).Error) '-KillIt with -Level 1 is refused'
+Assert-Equal $true ([bool](Resolve-RunLevel -Level 2 -KillIt $true -SkipUninstall $false).Error) '-KillIt with -Level 2 is refused'
+$r = Resolve-RunLevel -Level 2 -KillIt $false -SkipUninstall $true
+Assert-Equal '2|True' "$($r.Level)|$($r.SkipUninstall)" 'without -KillIt the level and switch pass through'
+
+# ---- level 1: which engine built an uninstaller, and the silent command for it
+$fp = Join-Path ([System.IO.Path]::GetTempPath()) ('killitwithfire-fp-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $fp -Force | Out-Null
+try {
+    $stub = { param([string] $Name, [string] $Marker) $p = Join-Path $fp $Name; [System.IO.File]::WriteAllBytes($p, [System.Text.Encoding]::ASCII.GetBytes(('MZ' + ('.' * 200) + $Marker + ('.' * 200)))); $p }
+    Assert-Equal 'Nsis' (Get-InstallerEngine (& $stub 'nsis.exe' 'NullsoftInst')) 'engine: NSIS by its overlay magic'
+    Assert-Equal 'InnoSetup' (Get-InstallerEngine (& $stub 'inno.exe' 'Inno Setup Setup Data')) 'engine: Inno Setup'
+    Assert-Equal 'WixBurn' (Get-InstallerEngine (& $stub 'burn.exe' '.wixburn')) 'engine: WiX Burn by its section'
+    Assert-Equal 'WixBurn' (Get-InstallerEngine (& $stub 'both.exe' 'NullsoftInst.wixburn')) 'engine: markers are checked in the agent''s order (Burn first)'
+    Assert-Equal 'Unknown' (Get-InstallerEngine (& $stub 'plain.exe' 'nothing to see')) 'engine: no marker is Unknown'
+    [System.IO.File]::WriteAllBytes((Join-Path $fp 'tiny.exe'), [byte[]](1, 2, 3))
+    Assert-Equal 'Unknown' (Get-InstallerEngine (Join-Path $fp 'tiny.exe')) 'engine: a file under 64 bytes is Unknown'
+    Assert-Equal 'Unknown' (Get-InstallerEngine (Join-Path $fp 'missing.exe')) 'engine: a missing file is Unknown, not an error'
+
+    $t = { param([hashtable] $h) $o = [ordered]@{ isMsi = $false; productCode = $null; uninstallString = $null; quietUninstallString = $null; installLocation = $null; entrySid = $null }; foreach ($k in $h.Keys) { $o[$k] = $h[$k] }; [pscustomobject]$o }
+    $c = Get-UninstallCommand (& $t @{ isMsi = $true; productCode = '{DDC95F26-92B1-4546-9678-5DC68DF76BA0}' })
+    Assert-Equal '/x {DDC95F26-92B1-4546-9678-5DC68DF76BA0} /qn /norestart' $c.Args 'MSI: msiexec /x, quiet'
+    $c = Get-UninstallCommand (& $t @{ uninstallString = 'MsiExec.exe /I{DDC95F26-92B1-4546-9678-5DC68DF76BA0}' })
+    Assert-Equal '/x {DDC95F26-92B1-4546-9678-5DC68DF76BA0} /qn /norestart' $c.Args 'an msiexec /I uninstall string is removed as an MSI'
+    $nsis = & $stub 'uninst.exe' 'NullsoftInst'
+    $c = Get-UninstallCommand (& $t @{ uninstallString = "`"$nsis`"" })
+    Assert-Equal "/S _?=$fp" $c.Args 'NSIS: /S, run in place from its own folder, _?= last and unquoted'
+    $other = Join-Path $fp 'installdir'; New-Item -ItemType Directory -Path $other -Force | Out-Null
+    $c = Get-UninstallCommand (& $t @{ uninstallString = "`"$nsis`""; installLocation = "$other\" })
+    Assert-Equal "/S _?=$other" $c.Args 'NSIS: InstallLocation wins for _?= (trailing slash dropped)'
+    $c = Get-UninstallCommand (& $t @{ quietUninstallString = "`"$nsis`" /S" })
+    Assert-Equal "/S _?=$fp" $c.Args 'NSIS from the QuietUninstallString: /S kept once, _?= added'
+    $c = Get-UninstallCommand (& $t @{ uninstallString = "`"$nsis`" /s" })
+    Assert-Equal "/s /S _?=$fp" $c.Args 'NSIS: a lowercase /s is not NSIS''s switch, so /S is added'
+    $innoByName = & $stub 'unins000.exe' 'nothing'
+    $c = Get-UninstallCommand (& $t @{ uninstallString = "`"$innoByName`"" })
+    Assert-Equal '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART' $c.Args 'Inno: unins000.exe gets its silent switches by name'
+    $burn = & $stub 'setup.exe' '.wixburn'
+    $c = Get-UninstallCommand (& $t @{ uninstallString = "`"$burn`" /uninstall" })
+    Assert-Equal '/uninstall /quiet /norestart' $c.Args 'Burn: a bare /uninstall is completed with /quiet'
+    $c = Get-UninstallCommand (& $t @{ quietUninstallString = "`"$burn`" /uninstall /quiet"; uninstallString = "`"$burn`" /uninstall" })
+    Assert-Equal '/uninstall /quiet' $c.Args 'a non-NSIS QuietUninstallString runs exactly as the vendor wrote it'
+    $plain = & $stub 'remove.exe' 'nothing'
+    $c = Get-UninstallCommand (& $t @{ uninstallString = "`"$plain`" /remove" })
+    Assert-Equal $true ([bool]$c.Skip -and -not $c.Exe) 'unknown engine with switches: skipped, never run (it would wait for a click)'
+    $c = Get-UninstallCommand (& $t @{ uninstallString = "`"$(Join-Path $fp 'gone.exe')`"" })
+    Assert-Equal $true ([bool]$c.Fail -and -not $c.Exe) 'a deleted uninstaller fails without running anything'
+    $c = Get-UninstallCommand (& $t @{ uninstallString = "`"$nsis`""; entrySid = 'S-1-5-21-1-2-3-9999' })
+    Assert-Equal $true ([bool]$c.Skip -and $c.Skip -like '*per-user*') 'another user''s per-user entry: its uninstaller is not run as us'
+    $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $c = Get-UninstallCommand (& $t @{ uninstallString = "`"$nsis`""; entrySid = $me })
+    Assert-Equal "/S _?=$fp" $c.Args 'our own per-user entry: its uninstaller runs'
+} finally { Remove-Item -LiteralPath $fp -Recurse -Force -ErrorAction SilentlyContinue }
 Assert-Equal '"C:\IT Logs\\"' (ConvertTo-ArgvString 'C:\IT Logs\') 'argv: a trailing backslash is doubled before the closing quote'
 Assert-Equal '"a\"b"' (ConvertTo-ArgvString 'a"b') 'argv: an embedded quote is escaped'
 Assert-Equal '"x\\\"y z"' (ConvertTo-ArgvString 'x\"y z') 'argv: backslashes before an embedded quote are doubled'
@@ -205,14 +266,15 @@ Assert-Equal '"M"=hex(7):61,00,00,00,62,00,00,00,00,00' $regLines[7] '.reg multi
 Assert-Equal '"B"=hex:01,ff' $regLines[8] '.reg binary'
 Assert-Equal '"N"=hex(1):78,00,0a,00,79,00,00,00' $regLines[9] '.reg string with a line break goes hex(1)'
 
-# ---- Leftovers never touches its own folders (a lab app named "Leftovers ... Test" once made the
-#      derived keyword "Leftovers" match C:\ProgramData\Leftovers, and the run moved its own backups)
-Assert-Equal $true ([bool](Get-OwnFolderConflict (Join-Path $env:ProgramData 'Leftovers'))) 'own folder: the runs parent itself'
+# ---- Kill It With Fire never touches its own folders (under the tool's first name, a lab app named
+#      "Leftovers ... Test" made the derived keyword "Leftovers" match C:\ProgramData\Leftovers, and the
+#      run moved its own backups; today's equivalent is KillItWithFire and C:\ProgramData\KillItWithFire)
+Assert-Equal $true ([bool](Get-OwnFolderConflict (Join-Path $env:ProgramData 'KillItWithFire'))) 'own folder: the runs parent itself'
 Assert-Equal $true ([bool](Get-OwnFolderConflict $env:ProgramData)) 'own folder: a parent that contains it'
-Assert-Equal $true ([bool](Get-OwnFolderConflict (Join-Path $env:ProgramData 'Leftovers\runs\x\files'))) 'own folder: anything inside'
-Assert-Equal $true ([bool](Get-OwnFolderConflict (Join-Path $env:SystemDrive '.leftovers\abc'))) 'own folder: a drive quarantine'
+Assert-Equal $true ([bool](Get-OwnFolderConflict (Join-Path $env:ProgramData 'KillItWithFire\runs\x\files'))) 'own folder: anything inside'
+Assert-Equal $true ([bool](Get-OwnFolderConflict (Join-Path $env:SystemDrive '.killitwithfire\abc'))) 'own folder: a drive quarantine'
 Assert-Equal $true ([bool](Get-OwnFolderConflict (Split-Path $PSScriptRoot -Parent))) 'own folder: the folder the script runs from'
-Assert-Equal $false ([bool](Get-OwnFolderConflict (Join-Path $env:ProgramData 'LeftoversLab'))) 'own folder: a sibling with a longer name is not'
+Assert-Equal $false ([bool](Get-OwnFolderConflict (Join-Path $env:ProgramData 'KillItWithFireLab'))) 'own folder: a sibling with a longer name is not'
 Assert-Equal $false ([bool](Get-OwnFolderConflict "$env:ProgramFiles\Notepad++")) 'own folder: an app folder is not'
 Assert-Equal 'C:\Program Files\X\locked.bin' (ConvertFrom-PendingRenameEntry '*1\??\C:\Program Files\X\locked.bin') 'boot-time move entry, Windows 11 form'
 Assert-Equal 'C:\X\a.dll' (ConvertFrom-PendingRenameEntry '\??\C:\X\a.dll') 'boot-time move entry, classic form'
@@ -220,7 +282,7 @@ Assert-Equal 'C:\X\b.dll' (ConvertFrom-PendingRenameEntry '*2!\??\C:\X\b.dll') '
 
 # ---- the run purge deletes trees deeper than 260 characters (scratch folder in %TEMP%; a review once
 #      claimed rd rejects the \\?\ form, and this proves it doesn't)
-$deep = Join-Path ([System.IO.Path]::GetTempPath()) ('leftovers-deep ' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+$deep = Join-Path ([System.IO.Path]::GetTempPath()) ('killitwithfire-deep ' + [guid]::NewGuid().ToString('N').Substring(0, 6))
 [void][System.IO.Directory]::CreateDirectory('\\?\' + $deep + '\' + (('d' * 50 + '\') * 6))
 [System.IO.File]::WriteAllText('\\?\' + $deep + '\' + (('d' * 50 + '\') * 6) + 'deep.txt', 'x')
 $script:Run = $null
@@ -228,11 +290,11 @@ Remove-TreeLongPath $deep
 Assert-Equal $false (Test-Path -LiteralPath $deep) 'long-path purge removes a 360-character tree (path with a space)'
 
 # ---- policy: the ENGINE refuses what an administrator locked
-$noPolicy = Get-LeftoversPolicy -Json $null
-if ($noPolicy.Source) { Write-Host "note: this machine has a real Leftovers policy ($($noPolicy.Source)); the no-policy case is checked with an empty JSON policy" }
-$empty = Get-LeftoversPolicy -Json '{}'
+$noPolicy = Get-KillItWithFirePolicy -Json $null
+if ($noPolicy.Source) { Write-Host "note: this machine has a real Kill It With Fire policy ($($noPolicy.Source)); the no-policy case is checked with an empty JSON policy" }
+$empty = Get-KillItWithFirePolicy -Json '{}'
 Assert-Equal 0 @(Get-PolicyViolations -Policy $empty -Level 3 -NoBackup $true -NoLog $true -LogPath 'C:\x.log' -IncludeUserData $true -QuarantineDays 30).Count 'no policy: nothing refused'
-$locked = Get-LeftoversPolicy -Json '{"MaxLevel":2,"RequireBackup":1,"RequireLog":1,"LogPath":"\\\\srv\\logs\\","AllowUserData":0,"QuarantineDays":30}'
+$locked = Get-KillItWithFirePolicy -Json '{"MaxLevel":2,"RequireBackup":1,"RequireLog":1,"LogPath":"\\\\srv\\logs\\","AllowUserData":0,"QuarantineDays":30}'
 Assert-Equal '2|True|True|\\srv\logs\|False|30' "$($locked.MaxLevel)|$($locked.RequireBackup)|$($locked.RequireLog)|$($locked.LogPath)|$($locked.AllowUserData)|$($locked.QuarantineDays)" 'policy parsed like the registry values'
 Assert-Equal 0 @(Get-PolicyViolations -Policy $locked -Level 2 -NoBackup $false -NoLog $false -LogPath '' -IncludeUserData $false -QuarantineDays 0).Count 'within the policy'
 Assert-Equal 1 @(Get-PolicyViolations -Policy $locked -Level 3 -NoBackup $false -NoLog $false -LogPath '' -IncludeUserData $false -QuarantineDays 0).Count 'level above MaxLevel'
@@ -261,10 +323,10 @@ function New-TestItem {
     $g = Get-CategoryGroup $Category
     [pscustomobject]@{ id = $Id; level = $Level; order = $script:Order[$Category]; category = $Category; group = $g; scope = 'machine'; target = "item $Id ($Category)"
         action = 'delete'; evidence = 'test'; risk = $Risk; review = [bool]$Review; optIn = ([bool]$Review -or $g -eq 'UserData'); note = ''; bytes = $Bytes
-        op = $(if ($NoOp) { $null } else { [pscustomobject]@{ kind = 'RegDeleteKey'; hive = 'HKLM64'; path = "SOFTWARE\LeftoversTest\$Id" } }) }
+        op = $(if ($NoOp) { $null } else { [pscustomobject]@{ kind = 'RegDeleteKey'; hive = 'HKLM64'; path = "SOFTWARE\KillItWithFireTest\$Id" } }) }
 }
 $testPlan = [pscustomobject]@{
-    tool = 'Leftovers'; version = $script:ToolVersion; runId = 'test'; computer = $env:COMPUTERNAME; generatedUtc = (Get-Date).ToUniversalTime().ToString('o'); level = 0; refused = $null
+    tool = 'KillItWithFire'; version = $script:ToolVersion; runId = 'test'; computer = $env:COMPUTERNAME; generatedUtc = (Get-Date).ToUniversalTime().ToString('o'); level = 0; refused = $null
     target = [pscustomobject]@{ displayName = 'Test App'; version = '1.0'; publisher = 'Test Co'; productCode = '{DDC95F26-92B1-4546-9678-5DC68DF76BA0}'; upgradeCode = $null; isMsi = $true
         uninstallEntries = @(); uninstallString = ''; quietUninstallString = ''; cachedMsi = $null; cachedMsiPresent = $false }
     items = @(
@@ -286,7 +348,7 @@ Assert-Equal '7' (& $ids (Select-PlanItems $testPlan 3 @('UserData') @() $false 
 # ---- profiles: the shipped ones load, a malformed one is refused, the registry fence holds
 $profs = @(Import-AppProfile)
 Assert-Equal 'Citrix Workspace,Notepad++,PuTTY,Zoom' ((@($profs | ForEach-Object { $_.Data.Name }) | Sort-Object) -join ',') 'shipped profiles load (the .example template does not)'
-$badDir = Join-Path ([System.IO.Path]::GetTempPath()) ('leftovers-prof-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+$badDir = Join-Path ([System.IO.Path]::GetTempPath()) ('killitwithfire-prof-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path $badDir -Force | Out-Null
 try {
     "@{ Name = 'Bad'; Match = @{ DisplayName = 'x' }; Items = @( @{ Kind = 'DeleteEverything'; Path = 'C:\'; Why = 'no' } ) }" | Set-Content -LiteralPath (Join-Path $badDir 'bad.psd1')
@@ -304,7 +366,7 @@ Assert-Equal $false ('SOFTWARE\Microsoftish Tools' -match $script:ProtectedRegis
 
 # ---- the window: built without showing it, rendered, control states checked (no elevation needed)
 $hostExe = (Get-Process -Id $PID).Path
-$guiDir = Join-Path ([System.IO.Path]::GetTempPath()) ('leftovers-gui-test-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+$guiDir = Join-Path ([System.IO.Path]::GetTempPath()) ('killitwithfire-gui-test-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path $guiDir -Force | Out-Null
 try {
     $planFile = Join-Path $guiDir 'plan.json'
@@ -318,7 +380,7 @@ try {
         $json = $out.Substring([Math]::Max(0, $out.IndexOf('{')))
         try { return ($json | ConvertFrom-Json) } catch { Write-Host "GUI self-test output was not JSON:`n$out"; return $null }
     }
-    $engine = Join-Path $PSScriptRoot '..\Leftovers.ps1'
+    $engine = Join-Path $PSScriptRoot '..\KillItWithFire.ps1'
     $s = & $runGui 'open.json' (Join-Path $guiDir 'open.png')
     Assert-Equal $true ($null -ne $s) 'window self-test ran (no policy)'
     if ($s) {
@@ -327,21 +389,30 @@ try {
         Assert-Equal 'Registration,LogonHooks,Drivers,Services,Files,Registry' ((@($s.categories) | ForEach-Object { ($_ -split ' ')[0] }) -join ',') 'checklist rows (user data has its own box; report-only rows never show)'
         Assert-Equal $true ((@($s.categories) | Where-Object { $_ -like 'Files*' }) -like '*50.0 MB*') 'checklist shows sizes'
         Assert-Equal $true ((@($s.categories) | Where-Object { $_ -like 'Drivers*' }) -like '*+1 need review*') 'checklist counts review items apart'
-        Assert-Equal ".\Leftovers.ps1 -ProductCode '{DDC95F26-92B1-4546-9678-5DC68DF76BA0}' -Level 3 -Force" $s.command 'equivalent command line'
+        Assert-Equal ".\KillItWithFire.ps1 -ProductCode '{DDC95F26-92B1-4546-9678-5DC68DF76BA0}' -Level 3 -Force" $s.command 'equivalent command line'
         Assert-Equal $true ($s.userDataText -like '*1 item(s), 1.0 MB*') 'user data box shows what it would add'
         Assert-Equal $true ([bool]$s.cleanEnabled) 'Clean up enabled once a plan is loaded'
         Assert-Equal '' $s.policyLabel 'no policy label'
+        Assert-Equal 'False|&Clean up|True' "$($s.killItChecked)|$($s.cleanText)|$($s.killItEnabled)" 'KILL IT starts unticked: the proper way is the default'
+        Assert-Equal $true ($null -ne $s.killIt) 'the KILL IT wiring was exercised'
+        if ($s.killIt) {
+            Assert-Equal 3 $s.killIt.level 'ticking KILL IT from Scan only jumps to Full scrub'
+            Assert-Equal ".\KillItWithFire.ps1 -ProductCode '{DDC95F26-92B1-4546-9678-5DC68DF76BA0}' -KillIt -Force" $s.killIt.command 'and the command line says -KillIt'
+            Assert-Equal '&Kill it' $s.killIt.cleanText 'and the button says Kill it'
+            Assert-Equal 'False|&Clean up' "$($s.killIt.checkedAfterLevel1)|$($s.killIt.cleanTextAfterLevel1)" 'dropping to level 1 unticks it (nothing to kill there)'
+        }
         Assert-Equal $true ((Get-Item -LiteralPath (Join-Path $guiDir 'open.png')).Length -gt 10000) 'window rendered to a PNG'
     }
     $s = & $runGui 'locked.json' (Join-Path $guiDir 'locked.png')
     Assert-Equal $true ($null -ne $s) 'window self-test ran (locked policy)'
     if ($s) {
         Assert-Equal 'True,True,True,False' (@($s.levelsEnabled) -join ',') 'MaxLevel 2 greys out Full scrub'
+        Assert-Equal $false ([bool]$s.killItEnabled) 'MaxLevel 2 greys out KILL IT too (it is a full scrub)'
         Assert-Equal 2 $s.level 'the highest allowed level is selected'
         Assert-Equal 'True|False|True|False|\\srv\logs\|False|False' "$($s.backupChecked)|$($s.backupEnabled)|$($s.logChecked)|$($s.logEnabled)|$($s.logPath)|$($s.logPathEnabled)|$($s.userDataEnabled)" 'locked options are set and greyed out'
         Assert-Equal $true ($s.policyLabel -like 'Set by your administrator:*highest level 2*') 'the lock is labelled'
         Assert-Equal 'Registration' ((@($s.categories) | ForEach-Object { ($_ -split ' ')[0] }) -join ',') 'level 2 shows registration only'
-        Assert-Equal ".\Leftovers.ps1 -ProductCode '{DDC95F26-92B1-4546-9678-5DC68DF76BA0}' -Level 2 -Log '\\srv\logs\' -Force" $s.command 'command line carries the locked log path'
+        Assert-Equal ".\KillItWithFire.ps1 -ProductCode '{DDC95F26-92B1-4546-9678-5DC68DF76BA0}' -Level 2 -Log '\\srv\logs\' -Force" $s.command 'command line carries the locked log path'
     }
     # -PolicyFile is refused outside the self-test: it can never stand in for an administrator's policy.
     & $hostExe -NoProfile -ExecutionPolicy Bypass -File $engine -Name 'x' -PolicyFile (Join-Path $guiDir 'open.json') *> $null
@@ -352,7 +423,7 @@ try {
 
 # ---- static: the engine parses, and every command it calls exists. A search-and-replace once turned
 # "Test-OurReference $val" into "Test-OurReference$val", which parses fine and only fails at run time.
-$engine = Join-Path $PSScriptRoot '..\Leftovers.ps1'
+$engine = Join-Path $PSScriptRoot '..\KillItWithFire.ps1'
 $tokens = $null; $parseErrors = $null
 [void][System.Management.Automation.Language.Parser]::ParseFile($engine, [ref]$tokens, [ref]$parseErrors)
 Assert-Equal 0 @($parseErrors).Count 'engine parses'
@@ -423,7 +494,7 @@ if ([Environment]::Is64BitOperatingSystem) {
     Assert-Equal $true ((Get-KeyNativePath 'HKLM32' 'SOFTWARE\Classes\CLSID') -match '(?i)WOW6432Node') 'machine: the 32-bit CLSID tree is redirected'
     Assert-Equal (Get-KeyNativePath 'HKLM64' 'SOFTWARE\Classes\.txt') (Get-KeyNativePath 'HKLM32' 'SOFTWARE\Classes\.txt') 'machine: file extensions are shared between the views'
     Assert-Equal 'HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall' (Format-RegPath 'HKLM32' 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall') 'machine: the 32-bit uninstall key is redirected'
-    Assert-Equal $null (Get-KeyNativePath 'HKLM64' 'SOFTWARE\Leftovers-no-such-key-7f3a') 'machine: a missing key has no native path'
+    Assert-Equal $null (Get-KeyNativePath 'HKLM64' 'SOFTWARE\KillItWithFire-no-such-key-7f3a') 'machine: a missing key has no native path'
 }
 
 Write-Host ("{0} passed, {1} failed ({2})" -f $script:pass, $script:fail, $PSVersionTable.PSVersion)

@@ -1,4 +1,4 @@
-# A Leftovers profile: what one app keeps where identity matching can't see it. Copy to <App>.psd1 in
+# A Kill It With Fire profile: what one app keeps where identity matching can't see it. Copy to <App>.psd1 in
 # this folder (files ending .psd1 load on their own) or pass it with -ProfilePath.
 #
 # Rules the engine enforces whatever a profile says:
