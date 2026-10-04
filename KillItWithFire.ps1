@@ -209,7 +209,7 @@ param(
 )
 
 Set-StrictMode -Version 2.0
-$script:ToolVersion = '0.4.0'
+$script:ToolVersion = '0.4.1'
 $script:ScriptPath = $PSCommandPath
 
 # =====================================================================================================
@@ -268,11 +268,25 @@ function ConvertTo-UtcDate {
     return [datetime]::Parse([string]$Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
 }
 
+$script:NormCache = New-Object 'System.Collections.Generic.Dictionary[string,object]'
 function Get-NormalizedPath {
     # Absolute local or UNC path, env vars expanded, NT prefixes stripped, no trailing backslash.
     # Anything else (relative, empty, garbage) is $null, so a caller can never match against it.
+    # Remembered per input: a scan asks for the same few hundred folders over and over, and Epic Games
+    # Launcher's 4,400 MSI components checked against every protected folder took 268 s (2026-10-04).
     param([string] $Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+    $hit = $null
+    if ($script:NormCache.TryGetValue($Path, [ref]$hit)) { return $hit }
+    $res = ConvertTo-NormalizedPath $Path
+    if ($script:NormCache.Count -ge 100000) { $script:NormCache.Clear() }
+    $script:NormCache[$Path] = $res
+    return $res
+}
+
+function ConvertTo-NormalizedPath {
+    # Get-NormalizedPath's work, uncached.
+    param([string] $Path)
     $p = [Environment]::ExpandEnvironmentVariables($Path.Trim().Trim('"').Trim())
     if ($p.StartsWith('\??\')) { $p = $p.Substring(4) }
     if ($p.StartsWith('\\?\')) { $p = $p.Substring(4) }
@@ -445,7 +459,32 @@ function Get-PathDepth {
     param([string] $Path)
     $p = Get-NormalizedPath $Path
     if (-not $p) { return 0 }
-    return @($p.Split('\') | Where-Object { $_ }).Count - 1
+    return $p.Split([char[]]@('\'), [StringSplitOptions]::RemoveEmptyEntries).Count - 1
+}
+
+function Get-ParentPath {
+    # The folder above a normalized path: "C:\a\b" -> "C:\a" -> "C:\" -> $null.
+    param([string] $Path)
+    if (-not $Path -or $Path.Length -le 3) { return $null }
+    $i = $Path.LastIndexOf('\')
+    if ($i -eq 2) { return $Path.Substring(0, 3) }
+    if ($i -le 2) { return $null }
+    return $Path.Substring(0, $i)
+}
+
+function Test-HoldsProgramFiles {
+    # Does a folder hold programs (.exe, .dll, .sys) anywhere in its first 20,000 files? It decides what is
+    # KEPT, so doubt keeps: unreadable, or too big to tell, counts as yes.
+    param([string] $Path)
+    $n = 0
+    try {
+        foreach ($f in [System.IO.Directory]::EnumerateFiles($Path, '*', [System.IO.SearchOption]::AllDirectories)) {
+            if ($f -match '\.(exe|dll|sys)$') { return $true }
+            $n++
+            if ($n -ge 20000) { return $true }
+        }
+    } catch { return $true }
+    return $false
 }
 
 function Get-ProtectedPathReason {
@@ -459,8 +498,12 @@ function Get-ProtectedPathReason {
     if (-not $p) { return 'not an absolute local path' }
     if ($p.StartsWith('\\')) { return 'network path' }
     if ((Get-PathDepth $p) -lt 2) { return 'too shallow (a root must be at least two folders deep)' }
+    # Test-PathUnder, inlined: $p is already normalized, and this runs once per folder of the app against
+    # every protected folder of every profile.
     foreach ($t in $TreePaths) {
-        if ($t -and (Test-PathUnder $p $t)) { return "inside protected folder $t" }
+        if (-not $t) { continue }
+        $tn = Get-NormalizedPath $t
+        if ($tn -and ($p.Equals($tn, [StringComparison]::OrdinalIgnoreCase) -or $p.StartsWith($tn.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase))) { return "inside protected folder $t" }
     }
     foreach ($c in $ContainerPaths) {
         $cn = Get-NormalizedPath $c
@@ -468,7 +511,7 @@ function Get-ProtectedPathReason {
     }
     foreach ($pf in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramW6432, $env:CommonProgramFiles, ${env:CommonProgramFiles(x86)}, $env:CommonProgramW6432)) {
         $pfn = Get-NormalizedPath $pf
-        if (-not $pfn -or $p.Equals($pfn, [StringComparison]::OrdinalIgnoreCase) -or -not (Test-PathUnder $p $pfn)) { continue }
+        if (-not $pfn -or $p.Equals($pfn, [StringComparison]::OrdinalIgnoreCase) -or -not $p.StartsWith($pfn.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { continue }
         $first = $p.Substring($pfn.Length).TrimStart('\').Split('\')[0]
         if ($first -match '^(?i)(Microsoft|Windows[ .]|WindowsApps$|ModifiableWindowsApps$|dotnet$|Internet Explorer$|microsoft shared$|System$|Services$|SpeechEngines$|DESIGNER$|Reference Assemblies$|MSBuild$|IIS|Windows Kits$)') {
             return "Microsoft/Windows folder $pfn\$first"
@@ -1023,6 +1066,17 @@ function Get-UninstallEntries {
             try { $k = $root.OpenSubKey($name, $false) } catch { Add-Unreadable 'uninstall entries'; continue }
             if ($null -eq $k) { continue }
             $dn = [string](Get-ValueSafe $k 'DisplayName')
+            # Installed date and size for the window (2026-10-04). No InstallDate: when the entry last changed,
+            # as Programs and Features shows it. EstimatedSize is KB, what the app itself reported.
+            $installed = ConvertFrom-InstallDate ([string](Get-ValueSafe $k 'InstallDate'))
+            $fromKey = $false
+            if (-not $installed) {
+                $ft = [long]0
+                try { $ft = [KillItWithFire.RegTime]::LastWriteFileTime($k.Handle) } catch { }
+                if ($ft -gt 0) { $installed = [datetime]::FromFileTime($ft).Date; $fromKey = $true }
+            }
+            $sizeKb = $null
+            try { $sv = Get-ValueSafe $k 'EstimatedSize'; if ($null -ne $sv) { $n = [long]$sv; if ($n -lt 0) { $n += 4294967296 }; if ($n -gt 0) { $sizeKb = $n } } } catch { }
             $entries.Add([pscustomobject]@{
                     Hive                 = $s.Hive
                     Sid                  = $s.Sid
@@ -1039,12 +1093,100 @@ function Get-UninstallEntries {
                     SystemComponent      = ((Get-ValueSafe $k 'SystemComponent') -eq 1)
                     IsMsi                = ((Get-ValueSafe $k 'WindowsInstaller') -eq 1)
                     ProductCode          = $(if (Test-IsGuid $name) { '{' + $name.Trim('{', '}').ToUpperInvariant() + '}' } else { $null })
+                    InstallDate          = $installed
+                    InstallDateFromKey   = $fromKey
+                    SizeKB               = $sizeKb
                 })
             Close-Key $k
         }
         Close-Key $root
     }
     return , $entries
+}
+
+function ConvertFrom-InstallDate {
+    # An uninstall entry's InstallDate: yyyyMMdd by convention, though vendors write other forms too.
+    # Anything unreadable or implausible is $null (the caller falls back to the key's own date).
+    param([string] $Text)
+    $t = ([string]$Text).Trim()
+    if (-not $t) { return $null }
+    $ci = [Globalization.CultureInfo]::InvariantCulture
+    foreach ($fmt in @('yyyyMMdd', 'yyyy-MM-dd', 'yyyy/MM/dd', 'yyyy.MM.dd', 'M/d/yyyy', 'MM/dd/yyyy', 'd.M.yyyy', 'dd.MM.yyyy')) {
+        $d = [datetime]::MinValue
+        if ([datetime]::TryParseExact($t, $fmt, $ci, [Globalization.DateTimeStyles]::None, [ref]$d)) {
+            if ($d.Year -ge 1990 -and $d -le (Get-Date).AddDays(1)) { return $d }
+            return $null
+        }
+    }
+    return $null
+}
+
+$script:SidNames = @{}
+function Get-EntryScopeLabel {
+    # Which uninstall key an entry lives in: the machine's 64-bit or 32-bit view, or one user's own. Spelled
+    # out (2026-10-04: "machine" read as neither 64- nor 32-bit).
+    param($Entry)
+    $sid = [string](Get-Prop $Entry 'Sid')
+    if ($sid) {
+        if (-not $script:SidNames.ContainsKey($sid)) {
+            $n = $sid
+            try { $n = ([System.Security.Principal.SecurityIdentifier]::new($sid)).Translate([System.Security.Principal.NTAccount]).Value.Split('\')[-1] } catch { }
+            $script:SidNames[$sid] = $n
+        }
+        return "User ($($script:SidNames[$sid]))"
+    }
+    if ((Get-Prop $Entry 'Hive') -eq 'HKLM32') { return 'Machine 32-bit' }
+    if ([Environment]::Is64BitOperatingSystem) { return 'Machine 64-bit' }
+    return 'Machine'
+}
+
+function Format-AppSize {
+    # EstimatedSize (KB, as the app reported it) the way the window shows it; nothing when unknown.
+    param($KB)
+    if ($null -eq $KB -or [double]$KB -le 0) { return '' }
+    $b = [double]$KB * 1KB
+    if ($b -ge 1GB) { return ('{0:N1} GB' -f ($b / 1GB)) }
+    if ($b -ge 10MB) { return ('{0:N0} MB' -f ($b / 1MB)) }
+    if ($b -ge 1MB) { return ('{0:N1} MB' -f ($b / 1MB)) }
+    return ('{0:N0} KB' -f [double]$KB)
+}
+
+function ConvertTo-VersionSortKey {
+    # "26.2.21931" -> "000000000026.000000000002.000000021931": the parts compare as numbers, text as text.
+    param([string] $Version)
+    if (-not $Version) { return '' }
+    return [regex]::Replace($Version.Trim(), '\d+', { param($m) $m.Value.TrimStart('0').PadLeft(12, '0') })
+}
+
+function Get-AppSortKey {
+    # The value the window's app list sorts on, per column: Name, Version, Publisher, Type, Scope, Installed, Size.
+    param($Entry, [int] $Column)
+    switch ($Column) {
+        1 { return (ConvertTo-VersionSortKey ([string](Get-Prop $Entry 'DisplayVersion'))) }
+        2 { return [string](Get-Prop $Entry 'Publisher') }
+        3 { return $(if (Get-Prop $Entry 'IsMsi') { 'MSI' } else { 'EXE' }) }
+        4 { return (Get-EntryScopeLabel $Entry) }
+        5 { return (Get-Prop $Entry 'InstallDate') }
+        6 { return (Get-Prop $Entry 'SizeKB') }
+    }
+    return [string](Get-Prop $Entry 'DisplayName')
+}
+
+function Select-AppListRows {
+    # The window's app list: the search text filters on name or publisher, then one column sorts it. Dates
+    # and sizes sort as dates and numbers, versions part by part, and an empty cell always goes last.
+    param($Entries, [string] $Filter, [int] $Column = 0, [bool] $Descending = $false)
+    $keyed = New-Object System.Collections.Generic.List[object]
+    foreach ($e in $Entries) {
+        if ($null -eq $e) { continue }
+        $name = [string](Get-Prop $e 'DisplayName')
+        if ($Filter -and $name.IndexOf($Filter, [StringComparison]::OrdinalIgnoreCase) -lt 0 -and ([string](Get-Prop $e 'Publisher')).IndexOf($Filter, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+        $k = Get-AppSortKey $e $Column
+        $keyed.Add([pscustomobject]@{ Entry = $e; Key = $k; Name = $name; Empty = ($null -eq $k -or "$k" -eq '') })
+    }
+    $full = @($keyed | Where-Object { -not $_.Empty } | Sort-Object -Property @{ Expression = 'Key'; Descending = $Descending }, @{ Expression = 'Name'; Descending = $false })
+    $none = @($keyed | Where-Object { $_.Empty } | Sort-Object -Property Name)
+    return @(@($full) + @($none) | ForEach-Object { $_.Entry })
 }
 
 function Get-EntryPaths {
@@ -1066,43 +1208,25 @@ function Get-EntryPaths {
 }
 
 function Get-MsiComponentIndex {
-    # ONE pass over every UserData\<sid>\Components\<packed component>: value name = packed client
-    # ProductCode ("000...0" = a permanent/system client), value data = the key path.
+    # ONE pass over every UserData\<sid>\Components\<packed component> (KillItWithFire.Fast, compiled: the
+    # PowerShell loop took 46 s on a machine with 53,000 component clients). All / Ours / ByComponent.
     param([string] $PackedPc)
-    $all = New-Object System.Collections.Generic.List[object]
-    $ours = New-Object System.Collections.Generic.List[object]
-    $byComponent = @{}
-    $udPath = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData'
-    $ud = Open-Key 'HKLM64' $udPath 'msi components'
-    foreach ($sid in (Get-SubKeyNamesSafe $ud 'msi components')) {
-        $comps = Open-Key 'HKLM64' "$udPath\$sid\Components" 'msi components'
-        foreach ($c in (Get-SubKeyNamesSafe $comps 'msi components')) {
-            $ck = $null
-            try { $ck = $comps.OpenSubKey($c, $false) } catch { Add-Unreadable 'msi components'; continue }
-            if ($null -eq $ck) { continue }
-            try {
-                foreach ($client in $ck.GetValueNames()) {
-                    if (-not $client) { continue }
-                    $cl = $client.ToUpperInvariant()
-                    $e = [pscustomobject]@{ Sid = $sid; Component = $c; Client = $cl; KeyPath = [string]$ck.GetValue($client, $null) }
-                    $all.Add($e)
-                    if (-not $byComponent.ContainsKey($c)) { $byComponent[$c] = New-Object System.Collections.Generic.List[string] }
-                    $byComponent[$c].Add($cl)
-                    if ($cl -eq $PackedPc) { $ours.Add($e) }
-                }
-            } catch { Add-Unreadable 'msi components' } finally { Close-Key $ck }
-        }
-        Close-Key $comps
-    }
-    Close-Key $ud
-    return [pscustomobject]@{ All = $all; Ours = $ours; ByComponent = $byComponent }
+    $ud = Open-Key 'HKLM64' 'SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData' 'msi components'
+    try { $ix = [KillItWithFire.Fast]::ReadComponentIndex($ud, $PackedPc) } finally { Close-Key $ud }
+    for ($i = 0; $i -lt $ix.Unreadable; $i++) { Add-Unreadable 'msi components' }
+    return $ix
 }
 
 function Get-OtherComponentClients {
     # Clients of a component other than us (a permanent "000...0" client counts: it is never removable).
+    # A loop, not a pipeline: it runs once per component of the app, 4,400 times for Epic Games Launcher.
     param($Index, [string] $Component, [string] $PackedPc)
     if ($null -eq $Index -or -not $Index.ByComponent.ContainsKey($Component)) { return @() }
-    return @($Index.ByComponent[$Component] | Where-Object { $_ -ne $PackedPc } | Select-Object -Unique)
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $others = New-Object System.Collections.Generic.List[string]
+    foreach ($cl in $Index.ByComponent[$Component]) { if ($cl -ne $PackedPc -and $seen.Add($cl)) { $others.Add($cl) } }
+    # Enumerated, not wrapped: every caller counts @(...) of this, and ", array" would always count 1.
+    return $others.ToArray()
 }
 
 function Invoke-ComMember {
@@ -1114,21 +1238,12 @@ function Get-MsiTableRows {
     # Read-only query of the cached MSI (OpenDatabase mode 0). Returns ONE array of rows: assign it to a
     # variable before piping (piping the call hands over the whole array as one item; review 2026-09-26).
     # A missing table is an empty result; any other failure is recorded in $script:MsiReadErrors.
+    # Through msi.dll directly (KillItWithFire.Fast): late-bound COM cost ~1.5 ms a field, 36 s for Epic Games
+    # Launcher's 4,400-row tables (2026-10-04).
     param([string] $MsiPath, [string] $Query, [int] $Columns)
     $rows = @()
     try {
-        $installer = New-Object -ComObject WindowsInstaller.Installer
-        $db = Invoke-ComMember $installer 'OpenDatabase' 'InvokeMethod' @($MsiPath, 0)
-        $view = Invoke-ComMember $db 'OpenView' 'InvokeMethod' @($Query)
-        [void](Invoke-ComMember $view 'Execute')
-        while ($true) {
-            $rec = Invoke-ComMember $view 'Fetch'
-            if ($null -eq $rec) { break }
-            $vals = @()
-            for ($i = 1; $i -le $Columns; $i++) { $vals += [string](Invoke-ComMember $rec 'StringData' 'GetProperty' @($i)) }
-            $rows += , $vals
-        }
-        [void](Invoke-ComMember $view 'Close')
+        $rows = [KillItWithFire.Fast]::MsiQuery($MsiPath, $Query, $Columns)
     } catch {
         if ($_.Exception.Message -notmatch 'OpenView|1604|table') { $script:MsiReadErrors += "$Query : $($_.Exception.InnerException.Message)" }
     }
@@ -1550,21 +1665,29 @@ function New-KillItWithFirePlan {
 
     # ---------------------------------------------------------------- identity: roots
     $otherEntries = @($entries | Where-Object { $matched -notcontains $_ -and $_.DisplayName -and -not ($pc -and $_.ProductCode -eq $pc) })
-    $rootCandidates = @()
+    # A List, not +=: Epic Games Launcher adds 4,400 candidates (one per MSI component).
+    $rootCandidates = New-Object System.Collections.Generic.List[object]
     foreach ($m in $matched) {
         foreach ($p in (Get-EntryPaths $m)) {
-            $rootCandidates += [pscustomobject]@{ Path = $p; Why = "uninstall entry ($($m.Display))" }
+            $rootCandidates.Add([pscustomobject]@{ Path = $p; Why = "uninstall entry ($($m.Display))" })
             if ((Split-Path $p -Leaf) -match '^\d+(\.\d+){1,3}$') {
-                $rootCandidates += [pscustomobject]@{ Path = (Split-Path $p -Parent); Why = "parent of the versioned folder $p" }
+                $rootCandidates.Add([pscustomobject]@{ Path = (Split-Path $p -Parent); Why = "parent of the versioned folder $p" })
             }
         }
     }
     $identityFiles = @()
     $componentRegValues = @()
+    # Every folder holding one of the app's MSI components, shared or not: what "the app's own folders" means
+    # when a root has to be split (below).
+    $ourCompDirs = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    # One protected-folder verdict per folder, not per component: 4,400 components live in a few hundred folders.
+    $protMemo = @{}
+    $ourFileComponent = @{}
     $sharedDllKeys = @((Open-Key 'HKLM64' 'SOFTWARE\Microsoft\Windows\CurrentVersion\SharedDLLs'), (Open-Key 'HKLM32' 'SOFTWARE\Microsoft\Windows\CurrentVersion\SharedDLLs'))
     foreach ($c in $ourComponents) {
         $kp = ConvertFrom-MsiKeyPath $c.KeyPath
         if ($null -eq $kp) { continue }
+        if ($kp.Kind -eq 'File') { [void]$ourCompDirs.Add($(if ($kp.IsFolder) { $kp.Path } else { Split-Path $kp.Path -Parent })) }
         # Registry-keyed components get the same shared-client check as files (review 2026-09-26).
         if (@(Get-OtherComponentClients $componentIndex $c.Component $packedPc).Count -gt 0) { continue }
         if ($kp.Kind -eq 'File') {
@@ -1574,10 +1697,12 @@ function New-KillItWithFirePlan {
                 foreach ($sk in $sharedDllKeys) { $n = [int](0 + (Get-ValueSafe $sk $kp.Path)); if ($n -gt $shared) { $shared = $n } }
                 if ($shared -gt 1) { Add-Kept $kp.Path "SharedDLLs count ${shared}: another installer still counts on it"; continue }
                 [void]$script:OurFiles.Add($kp.Path)
+                $ourFileComponent[$kp.Path] = $c.Component
             }
             $dir = if ($kp.IsFolder) { $kp.Path } else { Split-Path $kp.Path -Parent }
-            if (-not (Get-ProtectedPathReason $dir $containerProtected $treeProtected)) {
-                $rootCandidates += [pscustomobject]@{ Path = $dir; Why = "MSI component $($c.Component)" }
+            if (-not $protMemo.ContainsKey($dir)) { $protMemo[$dir] = Get-ProtectedPathReason $dir $containerProtected $treeProtected }
+            if (-not $protMemo[$dir]) {
+                $rootCandidates.Add([pscustomobject]@{ Path = $dir; Why = "MSI component $($c.Component)" })
             } elseif (-not $kp.IsFolder -and (Test-Path -LiteralPath $kp.Path -PathType Leaf)) {
                 $identityFiles += [pscustomobject]@{ Path = $kp.Path; Component = $c.Component }
             }
@@ -1588,16 +1713,72 @@ function New-KillItWithFirePlan {
     foreach ($sk in $sharedDllKeys) { Close-Key $sk }
 
     $roots = @(); $refusedRoots = @()
+    $rootSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $seenCand = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($cand in ($rootCandidates | Sort-Object { $_.Path.Length })) {
         $n = Get-NormalizedPath $cand.Path
         if (-not $n) { continue }
-        if (@($roots | Where-Object { Test-PathUnder $n $_.Path }).Count -gt 0) { continue }
-        $why = Get-ProtectedPathReason $n $containerProtected $treeProtected
+        # The same folder again: decided already, the first time (as a root, or as refused).
+        if (-not $seenCand.Add($n)) { continue }
+        # Inside a root already taken? Its parents, walked up: not every root against every candidate.
+        $a = $n; $inside = $false
+        while ($a) { if ($rootSet.Contains($a)) { $inside = $true; break }; $a = Get-ParentPath $a }
+        if ($inside) { continue }
+        if (-not $protMemo.ContainsKey($n)) { $protMemo[$n] = Get-ProtectedPathReason $n $containerProtected $treeProtected }
+        $why = $protMemo[$n]
         if ($why) {
             if (-not ($refusedRoots | Where-Object { $_.Path -eq $n })) { $refusedRoots += [pscustomobject]@{ Path = $n; Why = $why; From = $cand.Why } }
             continue
         }
         $roots += [pscustomobject]@{ Path = $n; Why = $cand.Why; Exists = (Test-Path -LiteralPath $n -PathType Container); Shared = $false; SharedWhy = $null }
+        [void]$rootSet.Add($n)
+    }
+
+    # ---------------------------------------------------------------- a root that also holds other programs
+    # An MSI app's uninstall entry can name its VENDOR folder. Epic Games Launcher's InstallLocation is
+    # C:\Program Files\Epic Games, which also holds Unreal Engine (UE_5.7) and the games the launcher
+    # installed, none of them registered as products. A full scrub would have quarantined all of it, and
+    # Unreal Editor's shortcut and firewall rules were planned as the launcher's (dev machine, 2026-10-04).
+    # When the app's own folders are known (its MSI components), such a root is split: the subfolders that
+    # hold the app's components become the roots, and the folder itself stays with the other program in it.
+    if ($ourCompDirs.Count) {
+        $split = @()
+        foreach ($r in @($roots)) {
+            if (-not $r.Exists -or $r.Why -like 'MSI component*') { continue }
+            # Which of its subfolders hold a component of ours, and are any of ours right in it?
+            $withOurs = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            foreach ($d in $ourCompDirs) {
+                $dn = Get-NormalizedPath $d
+                if (-not $dn -or -not $dn.StartsWith($r.Path.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { continue }
+                $rest = $dn.Substring($r.Path.TrimEnd('\').Length + 1)
+                [void]$withOurs.Add((Join-Path $r.Path ($rest.Split('\')[0])))
+            }
+            $foreign = @()
+            foreach ($child in @(Get-ChildItem -LiteralPath $r.Path -Directory -Force -ErrorAction SilentlyContinue)) {
+                if ($withOurs.Contains($child.FullName)) { continue }
+                if (Test-HoldsProgramFiles $child.FullName) { $foreign += $child.FullName }
+            }
+            if (-not $foreign.Count) { continue }
+            $split += [pscustomobject]@{ Root = $r; Ours = @($withOurs); Foreign = $foreign }
+        }
+        foreach ($s in $split) {
+            $roots = @($roots | Where-Object { $_ -ne $s.Root })
+            [void]$rootSet.Remove($s.Root.Path)
+            foreach ($f in $s.Foreign) { Add-Kept $f "another program's folder in $($s.Root.Path): it holds programs and none of this app's components" }
+            $names = @($s.Foreign | ForEach-Object { Split-Path $_ -Leaf }) -join ', '
+            foreach ($o in $s.Ours) {
+                if (-not (Test-Path -LiteralPath $o -PathType Container)) { continue }
+                if (-not $protMemo.ContainsKey($o)) { $protMemo[$o] = Get-ProtectedPathReason $o $containerProtected $treeProtected }
+                if ($protMemo[$o]) { continue }
+                $roots += [pscustomobject]@{ Path = $o; Why = "$($s.Root.Why), narrowed to the app's own folder ($($s.Root.Path) also holds $names)"; Exists = $true; Shared = $false; SharedWhy = $null }
+                [void]$rootSet.Add($o)
+            }
+            # The app's own files sitting right in the split folder still go, one by one.
+            foreach ($f in $script:OurFiles) {
+                if ((Split-Path $f -Parent) -eq $s.Root.Path -and (Test-Path -LiteralPath $f -PathType Leaf)) { $identityFiles += [pscustomobject]@{ Path = $f; Component = $ourFileComponent[$f] } }
+            }
+            $script:Warnings.Add("$($s.Root.Path) also holds other programs ($names), so it stays: only the app's own folder(s) in it go ($(@($s.Ours | ForEach-Object { Split-Path $_ -Leaf }) -join ', ')).")
+        }
     }
 
     # ---------------------------------------------------------------- cross-reference, BEFORE discovery
@@ -1935,20 +2116,20 @@ function New-KillItWithFirePlan {
     $pendingAppIds = @()
     foreach ($src in $comSources) {
         $clsidRoot = Open-Key $src.Hive "$($src.Path)\CLSID" 'COM classes'
-        foreach ($clsid in (Get-SubKeyNamesSafe $clsidRoot 'COM classes')) {
-            $ck = $null; try { $ck = $clsidRoot.OpenSubKey($clsid, $false) } catch { Add-Unreadable 'COM classes'; continue }
-            if ($null -eq $ck) { continue }
-            $appIdOfClass = [string](Get-ValueSafe $ck 'AppID')
+        # The registry walk is compiled (KillItWithFire.Fast): opening every class key from PowerShell was 64 s
+        # of a 137-second Epic Games Launcher scan (2026-10-04). The test on each value is unchanged.
+        $classes = [KillItWithFire.Fast]::ReadComClasses($clsidRoot)
+        for ($unr = 0; $unr -lt $classes.Unreadable; $unr++) { Add-Unreadable 'COM classes' }
+        foreach ($ci in $classes.Items) {
+            $clsid = $ci.Clsid
+            $appIdOfClass = [string]$ci.AppId
             $isOurs = $false
             foreach ($server in @('InprocServer32', 'LocalServer32', 'InprocHandler32')) {
-                $sk = $null; try { $sk = $ck.OpenSubKey($server, $false) } catch { }
-                $val = [string](Get-ValueSafe $sk '')
-                Close-Key $sk
+                $val = [string]$ci.$server
                 if ($val -and (Test-OurReference $val)) {
                     $isOurs = $true
                     [void]$ourClsids.Add($clsid)
-                    $pk = $null; try { $pk = $ck.OpenSubKey('ProgID', $false) } catch { }
-                    $progId = [string](Get-ValueSafe $pk ''); Close-Key $pk
+                    $progId = [string]$ci.ProgId
                     [void](Add-PlanItem -Category 'ComClass' -Level 3 -Scope $src.Scope -Target (Format-RegPath $src.Hive "$($src.Path)\CLSID\$clsid") `
                             -Action 'delete key' -Evidence "$server = $val (points at the app)" -Op (New-RegOp -Kind 'RegDeleteKey' -Hive $src.Hive -Path "$($src.Path)\CLSID\$clsid"))
                     if ($progId) {
@@ -1967,27 +2148,16 @@ function New-KillItWithFirePlan {
                 }
             }
             if ($appIdOfClass -and -not $isOurs) { $appIdUse["$($src.Hive)|$appIdOfClass"] = $true }
-            Close-Key $ck
         }
         Close-Key $clsidRoot
         if ($src.Hive -eq 'HKLM32') { continue }
         $tlRoot = Open-Key $src.Hive "$($src.Path)\TypeLib" 'COM type libraries'
-        foreach ($tl in (Get-SubKeyNamesSafe $tlRoot 'COM type libraries')) {
-            $tk = $null; try { $tk = $tlRoot.OpenSubKey($tl, $false) } catch { continue }
-            if ($null -eq $tk) { continue }
+        $tls = [KillItWithFire.Fast]::ReadTypeLibs($tlRoot)
+        for ($unr = 0; $unr -lt $tls.Unreadable; $unr++) { Add-Unreadable 'COM type libraries' }
+        foreach ($ti in $tls.Items) {
+            $tl = $ti.TypeLib
             $hit = $null
-            foreach ($ver in (Get-SubKeyNamesSafe $tk)) {
-                $vk = $null; try { $vk = $tk.OpenSubKey($ver, $false) } catch { continue }
-                foreach ($lcid in (Get-SubKeyNamesSafe $vk)) {
-                    foreach ($plat in @('win32', 'win64')) {
-                        $pk = $null; try { $pk = $vk.OpenSubKey("$lcid\$plat", $false) } catch { }
-                        $val = [string](Get-ValueSafe $pk ''); Close-Key $pk
-                        if ($val -and (Test-OurReference $val)) { $hit = $val }
-                    }
-                }
-                Close-Key $vk
-            }
-            Close-Key $tk
+            foreach ($val in $ti.Paths) { if (Test-OurReference $val) { $hit = $val } }
             if ($hit) {
                 [void](Add-PlanItem -Category 'ComTypeLib' -Level 3 -Scope $src.Scope -Target (Format-RegPath $src.Hive "$($src.Path)\TypeLib\$tl") `
                         -Action 'delete key' -Evidence "type library file $hit points at the app" -Op (New-RegOp -Kind 'RegDeleteKey' -Hive $src.Hive -Path "$($src.Path)\TypeLib\$tl"))
@@ -3082,6 +3252,202 @@ public static string FindPrompt(int[] pids, out bool visible) {
     }, IntPtr.Zero);
     visible = vis;
     return found;
+}
+'@
+}
+if (-not ('KillItWithFire.Fast' -as [type])) {
+    # Compiled loops for the two reads that dominate a scan of a big MSI app (Epic Games Launcher, 2026-10-04):
+    # the machine-wide Windows Installer component index (46 s in PowerShell) and the cached package's tables
+    # (36 s through late-bound COM, ~1.5 ms a field). Same data, same rules, compiled.
+    Add-Type -Namespace KillItWithFire -Name Fast -UsingNamespace System.Collections.Generic, System.Text, Microsoft.Win32 -MemberDefinition @'
+public sealed class ComponentClient { public string Sid; public string Component; public string Client; public string KeyPath; }
+public sealed class ComponentIndex {
+    public List<ComponentClient> All = new List<ComponentClient>();
+    public List<ComponentClient> Ours = new List<ComponentClient>();
+    public Dictionary<string, List<string>> ByComponent = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+    public int Unreadable;
+}
+// Every UserData\<sid>\Components\<packed component>: value name = packed client ProductCode ("000...0" = a
+// permanent/system client), value data = the key path.
+public static ComponentIndex ReadComponentIndex(RegistryKey userData, string packedPc) {
+    var ix = new ComponentIndex();
+    if (userData == null) { return ix; }
+    string[] sids;
+    try { sids = userData.GetSubKeyNames(); } catch { ix.Unreadable++; return ix; }
+    foreach (string sid in sids) {
+        RegistryKey comps = null;
+        try { comps = userData.OpenSubKey(sid + "\\Components", false); } catch { ix.Unreadable++; continue; }
+        if (comps == null) { continue; }
+        using (comps) {
+            string[] names;
+            try { names = comps.GetSubKeyNames(); } catch { ix.Unreadable++; continue; }
+            foreach (string c in names) {
+                RegistryKey ck = null;
+                try { ck = comps.OpenSubKey(c, false); } catch { ix.Unreadable++; continue; }
+                if (ck == null) { continue; }
+                using (ck) {
+                    try {
+                        foreach (string client in ck.GetValueNames()) {
+                            if (string.IsNullOrEmpty(client)) { continue; }
+                            string cl = client.ToUpperInvariant();
+                            object v = ck.GetValue(client, null);
+                            var e = new ComponentClient { Sid = sid, Component = c, Client = cl, KeyPath = v == null ? "" : v.ToString() };
+                            ix.All.Add(e);
+                            List<string> l;
+                            if (!ix.ByComponent.TryGetValue(c, out l)) { l = new List<string>(); ix.ByComponent[c] = l; }
+                            l.Add(cl);
+                            if (string.Equals(cl, packedPc, StringComparison.OrdinalIgnoreCase)) { ix.Ours.Add(e); }
+                        }
+                    } catch { ix.Unreadable++; }
+                }
+            }
+        }
+    }
+    return ix;
+}
+// A registry value as PowerShell's [string] cast shows it: arrays joined with spaces.
+static string AsText(object v) {
+    if (v == null) { return null; }
+    string[] ss = v as string[];
+    if (ss != null) { return string.Join(" ", ss); }
+    byte[] bs = v as byte[];
+    if (bs != null) { var parts = new string[bs.Length]; for (int i = 0; i < bs.Length; i++) { parts[i] = bs[i].ToString(); } return string.Join(" ", parts); }
+    return v.ToString();
+}
+static string DefaultOf(RegistryKey parent, string sub) {
+    RegistryKey k = null;
+    try { k = parent.OpenSubKey(sub, false); } catch { return null; }
+    if (k == null) { return null; }
+    using (k) { try { return AsText(k.GetValue("", null)); } catch { return null; } }
+}
+public sealed class ComClassInfo { public string Clsid; public string AppId; public string InprocServer32; public string LocalServer32; public string InprocHandler32; public string ProgId; }
+public sealed class ComClassList { public List<ComClassInfo> Items = new List<ComClassInfo>(); public int Unreadable; }
+// Every class under a CLSID key: its AppID and the default values of its server and ProgID subkeys.
+public static ComClassList ReadComClasses(RegistryKey clsidRoot) {
+    var list = new ComClassList();
+    if (clsidRoot == null) { return list; }
+    string[] names;
+    try { names = clsidRoot.GetSubKeyNames(); } catch { list.Unreadable++; return list; }
+    foreach (string clsid in names) {
+        RegistryKey ck = null;
+        try { ck = clsidRoot.OpenSubKey(clsid, false); } catch { list.Unreadable++; continue; }
+        if (ck == null) { continue; }
+        using (ck) {
+            var info = new ComClassInfo { Clsid = clsid };
+            try { info.AppId = AsText(ck.GetValue("AppID", null)); } catch { }
+            info.InprocServer32 = DefaultOf(ck, "InprocServer32");
+            info.LocalServer32 = DefaultOf(ck, "LocalServer32");
+            info.InprocHandler32 = DefaultOf(ck, "InprocHandler32");
+            info.ProgId = DefaultOf(ck, "ProgID");
+            list.Items.Add(info);
+        }
+    }
+    return list;
+}
+public sealed class TypeLibInfo { public string TypeLib; public List<string> Paths = new List<string>(); }
+public sealed class TypeLibList { public List<TypeLibInfo> Items = new List<TypeLibInfo>(); public int Unreadable; }
+// Every type library's file paths: <typelib>\<version>\<lcid>\win32 and \win64, in that order.
+public static TypeLibList ReadTypeLibs(RegistryKey tlRoot) {
+    var list = new TypeLibList();
+    if (tlRoot == null) { return list; }
+    string[] names;
+    try { names = tlRoot.GetSubKeyNames(); } catch { list.Unreadable++; return list; }
+    foreach (string tl in names) {
+        RegistryKey tk = null;
+        try { tk = tlRoot.OpenSubKey(tl, false); } catch { continue; }
+        if (tk == null) { continue; }
+        using (tk) {
+            var info = new TypeLibInfo { TypeLib = tl };
+            string[] vers;
+            try { vers = tk.GetSubKeyNames(); } catch { list.Unreadable++; continue; }
+            foreach (string ver in vers) {
+                RegistryKey vk = null;
+                try { vk = tk.OpenSubKey(ver, false); } catch { continue; }
+                if (vk == null) { continue; }
+                using (vk) {
+                    string[] lcids;
+                    try { lcids = vk.GetSubKeyNames(); } catch { list.Unreadable++; continue; }
+                    foreach (string lcid in lcids) {
+                        foreach (string plat in new[] { "win32", "win64" }) {
+                            string v = DefaultOf(vk, lcid + "\\" + plat);
+                            if (!string.IsNullOrEmpty(v)) { info.Paths.Add(v); }
+                        }
+                    }
+                }
+            }
+            if (info.Paths.Count > 0) { list.Items.Add(info); }
+        }
+    }
+    return list;
+}
+// Other products' FILE key paths inside our folders (prefixes end in a backslash).
+public static List<ComponentClient> FindClientsUnder(List<ComponentClient> all, string excludeClient, string[] prefixes) {
+    var hits = new List<ComponentClient>();
+    if (all == null || prefixes == null || prefixes.Length == 0) { return hits; }
+    foreach (ComponentClient e in all) {
+        if (string.Equals(e.Client, excludeClient, StringComparison.OrdinalIgnoreCase)) { continue; }
+        string raw = e.KeyPath;
+        if (string.IsNullOrEmpty(raw) || raw.Length < 4 || raw[2] != '\\') { continue; }
+        foreach (string p in prefixes) { if (raw.StartsWith(p, StringComparison.OrdinalIgnoreCase)) { hits.Add(e); break; } }
+    }
+    return hits;
+}
+[DllImport("msi.dll", CharSet = CharSet.Unicode)] private static extern uint MsiOpenDatabaseW(string path, IntPtr persist, out IntPtr db);
+[DllImport("msi.dll", CharSet = CharSet.Unicode)] private static extern uint MsiDatabaseOpenViewW(IntPtr db, string query, out IntPtr view);
+[DllImport("msi.dll")] private static extern uint MsiViewExecute(IntPtr view, IntPtr record);
+[DllImport("msi.dll")] private static extern uint MsiViewFetch(IntPtr view, out IntPtr record);
+[DllImport("msi.dll", CharSet = CharSet.Unicode)] private static extern uint MsiRecordGetStringW(IntPtr record, uint field, StringBuilder value, ref uint chars);
+[DllImport("msi.dll")] private static extern uint MsiCloseHandle(IntPtr handle);
+// A read-only query of an MSI (MSIDBOPEN_READONLY). A table the package doesn't have is no rows (1615);
+// any other failure throws, with the Windows Installer error code in the message.
+public static string[][] MsiQuery(string path, string query, int columns) {
+    IntPtr db;
+    uint r = MsiOpenDatabaseW(path, IntPtr.Zero, out db);
+    if (r != 0) { throw new InvalidOperationException("MsiOpenDatabase failed: " + r); }
+    var rows = new List<string[]>();
+    IntPtr view = IntPtr.Zero;
+    try {
+        r = MsiDatabaseOpenViewW(db, query, out view);
+        if (r == 1615) { return rows.ToArray(); }
+        if (r != 0) { throw new InvalidOperationException("MsiDatabaseOpenView failed: " + r); }
+        r = MsiViewExecute(view, IntPtr.Zero);
+        if (r != 0) { throw new InvalidOperationException("MsiViewExecute failed: " + r); }
+        var sb = new StringBuilder(512);
+        while (true) {
+            IntPtr rec;
+            r = MsiViewFetch(view, out rec);
+            if (r == 259) { break; }
+            if (r != 0) { throw new InvalidOperationException("MsiViewFetch failed: " + r); }
+            try {
+                var vals = new string[columns];
+                for (int i = 1; i <= columns; i++) {
+                    uint n = (uint)sb.Capacity;
+                    uint g = MsiRecordGetStringW(rec, (uint)i, sb, ref n);
+                    if (g == 234) { sb.Capacity = (int)n + 1; n = (uint)sb.Capacity; g = MsiRecordGetStringW(rec, (uint)i, sb, ref n); }
+                    vals[i - 1] = g == 0 ? sb.ToString() : "";
+                }
+                rows.Add(vals);
+            } finally { MsiCloseHandle(rec); }
+        }
+    } finally {
+        if (view != IntPtr.Zero) { MsiCloseHandle(view); }
+        MsiCloseHandle(db);
+    }
+    return rows.ToArray();
+}
+'@
+}
+if (-not ('KillItWithFire.RegTime' -as [type])) {
+    Add-Type -Namespace KillItWithFire -Name RegTime -MemberDefinition @'
+[DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+private static extern int RegQueryInfoKeyW(Microsoft.Win32.SafeHandles.SafeRegistryHandle hKey, IntPtr lpClass, IntPtr lpcchClass, IntPtr lpReserved,
+    IntPtr lpcSubKeys, IntPtr lpcbMaxSubKeyLen, IntPtr lpcbMaxClassLen, IntPtr lpcValues, IntPtr lpcbMaxValueNameLen, IntPtr lpcbMaxValueLen,
+    IntPtr lpcbSecurityDescriptor, out long lpftLastWriteTime);
+// When a key last changed (a FILETIME), or 0. Programs and Features shows this as "Installed On" for an app
+// that recorded no InstallDate, and so does the window.
+public static long LastWriteFileTime(Microsoft.Win32.SafeHandles.SafeRegistryHandle key) {
+    long ft;
+    return RegQueryInfoKeyW(key, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, out ft) == 0 ? ft : 0;
 }
 '@
 }
@@ -4236,10 +4602,34 @@ function Get-GuiGroups {
         $label = "$g  -  $($script:CategoryLabels[$g]): $($normal.Count) item(s)"
         if ($bytes) { $label += ', {0:N1} MB' -f ($bytes / 1MB) }
         if ($crit) { $label += ", $crit critical" }
-        if ($review) { $label += " (+$review need review)" }
+        if ($review) { $label += " (+$review uncertain)" }
         $rows += [pscustomobject]@{ Group = $g; Label = $label; Count = $normal.Count; Review = $review }
     }
     return $rows
+}
+
+$script:WindowIcon = $null   # set once, by the first window (strict mode: read before it is set throws)
+function New-FlameIcon {
+    # The window's icon: a flame drawn here at run time, so there is no image file to ship and nothing is
+    # fetched from anywhere (2026-10-04).
+    param([int] $Size = 32)
+    Add-Type -AssemblyName System.Drawing
+    $bmp = New-Object System.Drawing.Bitmap($Size, $Size)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    try {
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $k = $Size / 32.0
+        $pt = { param($x, $y) New-Object System.Drawing.PointF(([single]($x * $k)), ([single]($y * $k))) }
+        $outer = [System.Drawing.PointF[]]@((& $pt 16 1), (& $pt 20 7), (& $pt 25 12), (& $pt 27.5 19), (& $pt 25 26), (& $pt 19.5 30.5), (& $pt 12.5 30.5),
+            (& $pt 7 26), (& $pt 4.5 19), (& $pt 7.5 12), (& $pt 10.5 15.5), (& $pt 11.5 8.5))
+        $inner = [System.Drawing.PointF[]]@((& $pt 16.5 12), (& $pt 20 18), (& $pt 21.5 23.5), (& $pt 19 28), (& $pt 16 29.5), (& $pt 13 28), (& $pt 10.5 23.5), (& $pt 12.5 18))
+        $red = New-Object System.Drawing.Drawing2D.LinearGradientBrush((& $pt 16 1), (& $pt 16 31), [System.Drawing.Color]::FromArgb(255, 200, 30, 20), [System.Drawing.Color]::FromArgb(255, 255, 110, 20))
+        $yellow = New-Object System.Drawing.Drawing2D.LinearGradientBrush((& $pt 16 12), (& $pt 16 30), [System.Drawing.Color]::FromArgb(255, 255, 190, 30), [System.Drawing.Color]::FromArgb(255, 255, 240, 150))
+        $g.FillClosedCurve($red, $outer, [System.Drawing.Drawing2D.FillMode]::Winding, [single]0.4)
+        $g.FillClosedCurve($yellow, $inner, [System.Drawing.Drawing2D.FillMode]::Winding, [single]0.4)
+        $red.Dispose(); $yellow.Dispose()
+    } finally { $g.Dispose() }
+    return [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
 }
 
 function New-KillItWithFireForm {
@@ -4262,7 +4652,9 @@ function New-KillItWithFireForm {
     $ui = @{ Plan = $null; PlanFile = $null; App = $null; Unchecked = @{}; Loading = $false; Policy = $Policy }
     $bold = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
     $f = New-Object System.Windows.Forms.Form
-    $f.Text = 'Kill It With Fire - clean up an app whose uninstall is broken'
+    $f.Text = 'Kill It With Fire - remove an app completely'
+    if (-not $script:WindowIcon) { try { $script:WindowIcon = New-FlameIcon } catch { } }
+    if ($script:WindowIcon) { $f.Icon = $script:WindowIcon }
     # Fits a 1024x768 screen: the buttons live in a bar docked at the bottom and the rest scrolls, so
     # Clean up / Restore / Close are never off-screen (they were, on the lab VM).
     $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
@@ -4286,7 +4678,12 @@ function New-KillItWithFireForm {
     $btnScan = New-Object System.Windows.Forms.Button; $btnScan.Text = '&Scan'; $btnScan.Location = '640,30'; $btnScan.Size = '92,27'; $btnScan.Anchor = 'Top,Right'
     $tip.SetToolTip($btnScan, 'Build the plan for the selected app. Scanning changes nothing.')
     $apps = New-Object System.Windows.Forms.ListView; $apps.Location = '12,62'; $apps.Size = '820,150'; $apps.View = 'Details'; $apps.FullRowSelect = $true; $apps.HideSelection = $false; $apps.MultiSelect = $false; $apps.Anchor = 'Top,Left,Right'
-    foreach ($c in @(@('Name', 330), @('Version', 110), @('Publisher', 220), @('Type', 60), @('Scope', 80))) { [void]$apps.Columns.Add($c[0], $c[1]) }
+    $apps.ShowItemToolTips = $true
+    # Click a header to sort by it, again to reverse (Show-KillItWithFireGui). Installed and Size added 2026-10-04.
+    foreach ($c in @(@('Name', 250, 'Left'), @('Version', 95, 'Left'), @('Publisher', 160, 'Left'), @('Type', 45, 'Left'), @('Scope', 110, 'Left'), @('Installed', 78, 'Left'), @('Size', 62, 'Right'))) {
+        [void]$apps.Columns.Add([string]$c[0], [int]$c[1], [System.Windows.Forms.HorizontalAlignment]$c[2])
+    }
+    $ui.AppColumns = @('Name', 'Version', 'Publisher', 'Type', 'Scope', 'Installed', 'Size'); $ui.SortColumn = 0; $ui.SortDesc = $false
     $ui.Search = $search; $ui.Apps = $apps; $ui.Scan = $btnScan
 
     # 2. How far
@@ -4321,8 +4718,10 @@ function New-KillItWithFireForm {
     $txtLog = New-Object System.Windows.Forms.TextBox; $txtLog.Location = '430,20'; $txtLog.Size = '378,24'; $txtLog.Anchor = 'Top,Left,Right'
     $tip.SetToolTip($txtLog, 'A file or a folder. Empty = log.txt in the run folder.')
     $chkUser = New-Object System.Windows.Forms.CheckBox; $chkUser.Text = 'Include user &data (AppData)'; $chkUser.Location = '12,52'; $chkUser.AutoSize = $true
-    $chkReview = New-Object System.Windows.Forms.CheckBox; $chkReview.Text = 'Include items that need revie&w'; $chkReview.Location = '330,52'; $chkReview.AutoSize = $true
-    $tip.SetToolTip($chkReview, 'Items tied to the app only by vendor name, signer, or one MSI claim on a Windows file.')
+    # "Include items that need review" read as "important, look at these", so as something to tick (first
+    # outside try of the window, 2026-10-04). These are the WEAK matches, off on purpose: the tooltip says why.
+    $chkReview = New-Object System.Windows.Forms.CheckBox; $chkReview.Text = 'Also remove uncer&tain matches'; $chkReview.Location = '330,52'; $chkReview.AutoSize = $true
+    $tip.SetToolTip($chkReview, "Items tied to the app only by a name, its vendor or signer, or one MSI's claim on a Windows file. They may belong to another app or to Windows, so they stay unless you tick this. View items... lists each one and why it is uncertain.")
     # KILL IT (2026-10-03): the hard way as its own, unmissable choice. Off (the default) is the proper way:
     # the app's own uninstaller runs first. On is -KillIt: no uninstaller, the level jumps to Full scrub, and
     # the Clean up button says "Kill it" so nobody does it by accident.
@@ -4407,7 +4806,7 @@ function New-KillItWithFireForm {
         $udBytes = [long]0; foreach ($i in $ud) { if ($null -ne $i.bytes) { $udBytes += [long]$i.bytes } }
         $ui.UserData.Text = if ($ud.Count) { 'Include user &data (AppData): {0} item(s), {1:N1} MB' -f $ud.Count, ($udBytes / 1MB) } else { 'Include user &data (AppData)' }
         $rv = @($planItems | Where-Object { $_.review -and $null -ne $_.op -and $_.level -le $lvl })
-        $ui.Review.Text = if ($rv.Count) { "Include items that need revie&w: $($rv.Count)" } else { 'Include items that need revie&w' }
+        $ui.Review.Text = if ($rv.Count) { "Also remove uncer&tain matches: $($rv.Count)" } else { 'Also remove uncer&tain matches' }
         & $ui.UpdateCommand
     }
     $ui.LoadPlan = {
@@ -4455,6 +4854,7 @@ function Show-TextDialog {
     param([string] $Title, [string] $Text, $Owner)
     $d = New-Object System.Windows.Forms.Form
     $d.Text = $Title; $d.ClientSize = New-Object System.Drawing.Size(860, 520); $d.StartPosition = 'CenterParent'; $d.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    if ($script:WindowIcon) { $d.Icon = $script:WindowIcon }
     $tb = New-Object System.Windows.Forms.TextBox; $tb.Multiline = $true; $tb.ReadOnly = $true; $tb.ScrollBars = 'Both'; $tb.WordWrap = $false
     $tb.Font = New-Object System.Drawing.Font('Consolas', 9); $tb.Location = '10,10'; $tb.Size = '840,462'; $tb.Anchor = 'Top,Bottom,Left,Right'
     $tb.Text = ($Text -replace "(?<!`r)`n", "`r`n")
@@ -4484,6 +4884,40 @@ function Start-KillItWithFireChild {
     return [System.Diagnostics.Process]::Start($psi)
 }
 
+function Update-AppList {
+    # The window's app list, rebuilt on every filter keystroke and every header click. The selected app stays
+    # selected (and keeps its scan): $Ui.Filling mutes the selection handler while the rows are swapped.
+    param($Ui, $All)
+    $Ui.Filling = $true
+    $keep = $null
+    $Ui.Apps.BeginUpdate(); $Ui.Apps.Items.Clear()
+    foreach ($e in (Select-AppListRows -Entries $All -Filter $Ui.Search.Text -Column $Ui.SortColumn -Descending $Ui.SortDesc)) {
+        $li = New-Object System.Windows.Forms.ListViewItem([string]$e.DisplayName)
+        $li.UseItemStyleForSubItems = $false
+        [void]$li.SubItems.Add([string]$e.DisplayVersion); [void]$li.SubItems.Add([string]$e.Publisher)
+        [void]$li.SubItems.Add($(if ($e.IsMsi) { 'MSI' } else { 'EXE' })); [void]$li.SubItems.Add((Get-EntryScopeLabel $e))
+        $date = Get-Prop $e 'InstallDate'
+        $d = $li.SubItems.Add($(if ($date) { $date.ToString('yyyy-MM-dd') } else { '' }))
+        if (Get-Prop $e 'InstallDateFromKey') {
+            $d.ForeColor = [System.Drawing.SystemColors]::GrayText
+            $li.ToolTipText = 'Grey date: the app recorded no install date, so this is when its uninstall entry last changed (what Programs and Features shows too).'
+        }
+        [void]$li.SubItems.Add((Format-AppSize (Get-Prop $e 'SizeKB')))
+        $li.Tag = $e
+        [void]$Ui.Apps.Items.Add($li)
+        if ($Ui.App -and $e.KeyPath -eq $Ui.App.KeyPath -and $e.Hive -eq $Ui.App.Hive) { $li.Selected = $true; $keep = $li }
+    }
+    for ($i = 0; $i -lt $Ui.Apps.Columns.Count; $i++) {
+        $arrow = if ($i -ne $Ui.SortColumn) { '' } elseif ($Ui.SortDesc) { ' ' + [char]0x25BC } else { ' ' + [char]0x25B2 }
+        $Ui.Apps.Columns[$i].Text = $Ui.AppColumns[$i] + $arrow
+    }
+    $Ui.Apps.EndUpdate()
+    $Ui.Filling = $false
+    if ($keep) { $keep.EnsureVisible() }
+    # One app left after filtering: select it, so typing its name and pressing Alt+S scans it.
+    elseif ($Ui.Apps.Items.Count -eq 1) { $Ui.Apps.Items[0].Selected = $true }
+}
+
 function Show-KillItWithFireGui {
     param($Policy)
     $ui = New-KillItWithFireForm -Policy $Policy
@@ -4495,25 +4929,20 @@ function Show-KillItWithFireGui {
     $work = Join-Path $guiRoot ([guid]::NewGuid().ToString('N').Substring(0, 8))
     [void](New-Item -ItemType Directory -Force -Path $work)
     $all = @((Get-UninstallEntries (Get-LoadedUserSids)) | Where-Object { $_.DisplayName -and -not $_.SystemComponent } | Sort-Object DisplayName)
-    $fill = {
-        $ui.Apps.BeginUpdate(); $ui.Apps.Items.Clear()
-        foreach ($e in $all) {
-            if ($ui.Search.Text -and $e.DisplayName.IndexOf($ui.Search.Text, [StringComparison]::OrdinalIgnoreCase) -lt 0 -and ([string]$e.Publisher).IndexOf($ui.Search.Text, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
-            $li = New-Object System.Windows.Forms.ListViewItem($e.DisplayName)
-            [void]$li.SubItems.Add([string]$e.DisplayVersion); [void]$li.SubItems.Add([string]$e.Publisher)
-            [void]$li.SubItems.Add($(if ($e.IsMsi) { 'MSI' } else { 'EXE' })); [void]$li.SubItems.Add($(if ($e.Sid) { 'user' } elseif ($e.Hive -eq 'HKLM32') { '32-bit' } else { 'machine' }))
-            $li.Tag = $e
-            [void]$ui.Apps.Items.Add($li)
-        }
-        $ui.Apps.EndUpdate()
-        # One app left after filtering: select it, so typing its name and pressing Alt+S scans it.
-        if ($ui.Apps.Items.Count -eq 1) { $ui.Apps.Items[0].Selected = $true }
-    }
+    $fill = { Update-AppList $ui $all }
     & $fill
     $ui.Search.Add_TextChanged({ & $fill })
+    $ui.Apps.Add_ColumnClick({
+            param($s, $e)
+            # The same header again reverses it. Installed and Size start newest and biggest first.
+            if ($ui.SortColumn -eq $e.Column) { $ui.SortDesc = -not $ui.SortDesc } else { $ui.SortColumn = $e.Column; $ui.SortDesc = ($e.Column -ge 5) }
+            & $fill
+        })
     $ui.Apps.Add_SelectedIndexChanged({
-            if (-not $ui.Apps.SelectedItems.Count) { return }
-            $ui.App = $ui.Apps.SelectedItems[0].Tag
+            if ($ui.Filling -or -not $ui.Apps.SelectedItems.Count) { return }
+            $picked = $ui.Apps.SelectedItems[0].Tag
+            if ($ui.App -and $picked.KeyPath -eq $ui.App.KeyPath -and $picked.Hive -eq $ui.App.Hive) { return }
+            $ui.App = $picked
             $ui.Plan = $null; $ui.PlanFile = $null
             & $ui.Rebuild
             $ui.Status.Text = "Selected '$($ui.App.DisplayName)'. Press Scan."
@@ -4564,6 +4993,18 @@ function Show-KillItWithFireGui {
     # (review 2026-09-26).
     $ui.Form.Add_FormClosing({
             if ($state.Proc -and -not $state.Proc.HasExited) {
+                # A scan changes nothing, so it may be stopped (an Epic Games Launcher scan ran past seven minutes
+                # and the window would not close, 2026-10-04). A cleanup or restore may not: it would stop part way.
+                if ($state.Kind -eq 'Scan') {
+                    $a = [System.Windows.Forms.MessageBox]::Show('The scan is still running. Stop it and close? A scan changes nothing, so stopping it is safe.', 'Kill It With Fire', 'YesNo', 'Question')
+                    if ($a -eq [System.Windows.Forms.DialogResult]::Yes) {
+                        $timer.Stop()
+                        try { Stop-ProcessTreeSince @(Get-ProcessTreeSince $state.Proc.Id ($state.Started.AddSeconds(-2))) } catch { }
+                        return
+                    }
+                    $_.Cancel = $true
+                    return
+                }
                 $_.Cancel = $true
                 [void][System.Windows.Forms.MessageBox]::Show("The $($state.Kind.ToLowerInvariant()) is still running. Wait for it to finish: closing now would leave it running with nobody watching.", 'Kill It With Fire', 'OK', 'Warning')
             }
@@ -4587,7 +5028,7 @@ function Show-KillItWithFireGui {
     $ui.View.Add_Click({
             if (-not $ui.Plan) { return }
             $g = if ($ui.Categories.SelectedIndex -ge 0) { ([string]$ui.Categories.SelectedItem -split ' ')[0] } else { $null }
-            $dlg = New-Object System.Windows.Forms.Form; $dlg.Text = $(if ($g) { "Items: $g" } else { 'All items' }); $dlg.ClientSize = New-Object System.Drawing.Size(1000, 520); $dlg.StartPosition = 'CenterParent'; $dlg.Font = $ui.Form.Font
+            $dlg = New-Object System.Windows.Forms.Form; $dlg.Text = $(if ($g) { "Items: $g" } else { 'All items' }); $dlg.ClientSize = New-Object System.Drawing.Size(1000, 520); $dlg.StartPosition = 'CenterParent'; $dlg.Font = $ui.Form.Font; $dlg.Icon = $ui.Form.Icon
             $lv = New-Object System.Windows.Forms.ListView; $lv.Dock = 'Fill'; $lv.View = 'Details'; $lv.FullRowSelect = $true
             foreach ($c in @(@('Level', 44), @('Risk', 110), @('Target', 390), @('Action', 220), @('Why', 300))) { [void]$lv.Columns.Add($c[0], $c[1]) }
             foreach ($i in @($ui.Plan.items | Where-Object { -not $g -or $_.group -eq $g })) {
@@ -4618,7 +5059,7 @@ function Show-KillItWithFireGui {
         })
     $ui.Restore.Add_Click({
             $runs = @(Get-RunList | Where-Object { $_.backup -and $_.status -ne 'restored' })
-            $dlg = New-Object System.Windows.Forms.Form; $dlg.Text = 'Restore a run'; $dlg.ClientSize = New-Object System.Drawing.Size(780, 330); $dlg.StartPosition = 'CenterParent'; $dlg.Font = $ui.Form.Font
+            $dlg = New-Object System.Windows.Forms.Form; $dlg.Text = 'Restore a run'; $dlg.ClientSize = New-Object System.Drawing.Size(780, 330); $dlg.StartPosition = 'CenterParent'; $dlg.Font = $ui.Form.Font; $dlg.Icon = $ui.Form.Icon
             $lv = New-Object System.Windows.Forms.ListView; $lv.Location = '10,10'; $lv.Size = '760,262'; $lv.View = 'Details'; $lv.FullRowSelect = $true; $lv.MultiSelect = $false; $lv.Anchor = 'Top,Bottom,Left,Right'
             foreach ($c in @(@('Run', 170), @('App', 250), @('Level', 50), @('Items', 50), @('Status', 110), @('Finished (UTC)', 120))) { [void]$lv.Columns.Add($c[0], $c[1]) }
             foreach ($r in $runs) {
@@ -4676,6 +5117,7 @@ function Invoke-GuiSelfTest {
         killItChecked = $ui.KillIt.Checked; cleanText = $ui.Clean.Text; userDataEnabled = $ui.UserData.Enabled; userDataText = $ui.UserData.Text; reviewText = $ui.Review.Text; policyLabel = $ui.PolicyLabel.Text
         categories = @($ui.Categories.Items | ForEach-Object { [string]$_ }); categoriesEnabled = $ui.Categories.Enabled; description = $ui.Description.Text
         command = $ui.Command.Text; cleanEnabled = $ui.Clean.Enabled; killItEnabled = $ui.KillIt.Enabled; killIt = $null
+        title = $ui.Form.Text; hasIcon = ($null -ne $script:WindowIcon -and [object]::ReferenceEquals($ui.Form.Icon, $script:WindowIcon)); appColumns = @($ui.Apps.Columns | ForEach-Object { $_.Text })
     }
     # The KILL IT wiring: from Scan only, ticking it must jump to Full scrub, say -KillIt, and relabel the
     # button; dropping back to level 1 must untick it (there is nothing to kill there).
@@ -4727,7 +5169,8 @@ function Invoke-Main {
         $rows = $entries | Where-Object { $_.DisplayName } | Sort-Object DisplayName, DisplayVersion |
             Select-Object @{ n = 'Name'; e = { if ($_.DisplayName.Length -gt 60) { $_.DisplayName.Substring(0, 57) + '...' } else { $_.DisplayName } } }, @{ n = 'Version'; e = { $_.DisplayVersion } },
             @{ n = 'Publisher'; e = { if ($_.Publisher.Length -gt 30) { $_.Publisher.Substring(0, 27) + '...' } else { $_.Publisher } } }, @{ n = 'Type'; e = { if ($_.IsMsi) { 'MSI' } else { 'EXE' } } },
-            @{ n = 'Scope'; e = { if ($_.Sid) { 'user' } elseif ($_.Hive -eq 'HKLM32') { '32-bit' } else { 'machine' } } }, @{ n = 'ProductCode'; e = { $_.ProductCode } }
+            @{ n = 'Scope'; e = { Get-EntryScopeLabel $_ } }, @{ n = 'Installed'; e = { if ($_.InstallDate) { $_.InstallDate.ToString('yyyy-MM-dd') } } },
+            @{ n = 'Size'; e = { Format-AppSize $_.SizeKB } }, @{ n = 'ProductCode'; e = { $_.ProductCode } }
         $rows | Format-Table -AutoSize | Out-String -Width 400 | Write-Host
         return 0
     }

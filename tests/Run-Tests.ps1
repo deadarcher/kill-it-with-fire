@@ -320,6 +320,80 @@ $w = Wait-Uninstaller -Process $p -Target $null -CeilingSec 4 -IdleSec 30 -PollS
 Assert-Equal $true ([string]$w.Stopped -like 'timed out after 4 s*') "level 1: the ceiling stops it ($($w.Stopped))"
 Assert-Equal $true ($p.WaitForExit(5000)) 'level 1: ... and the timed-out process is gone'
 
+# ---- the window's app list (2026-10-04): install date, size, spelled-out scope, and sorting by any column
+Assert-Equal '2026-02-12' ((ConvertFrom-InstallDate '20260212').ToString('yyyy-MM-dd')) 'install date: yyyyMMdd'
+Assert-Equal '2025-07-04' ((ConvertFrom-InstallDate '7/4/2025').ToString('yyyy-MM-dd')) 'install date: M/d/yyyy'
+Assert-Equal $null (ConvertFrom-InstallDate '19800101') 'install date: implausibly old is no date'
+Assert-Equal $null (ConvertFrom-InstallDate 'yesterday') 'install date: unreadable is no date'
+Assert-Equal '' (Format-AppSize $null) 'size: unknown is blank'
+Assert-Equal '850 KB' (Format-AppSize 850) 'size: KB'
+Assert-Equal ('{0:N1} MB' -f 1.5) (Format-AppSize 1536) 'size: small MB keeps a decimal'
+Assert-Equal '188 MB' (Format-AppSize 192868) 'size: MB'
+Assert-Equal ('{0:N1} GB' -f 2) (Format-AppSize (2 * 1024 * 1024)) 'size: GB'
+Assert-Equal $true ((ConvertTo-VersionSortKey '10.2') -gt (ConvertTo-VersionSortKey '9.12')) 'version sort: 10.2 after 9.12 (numbers, not text)'
+Assert-Equal 'Machine 32-bit' (Get-EntryScopeLabel ([pscustomobject]@{ Hive = 'HKLM32'; Sid = $null })) 'scope: 32-bit view'
+Assert-Equal $(if ([Environment]::Is64BitOperatingSystem) { 'Machine 64-bit' } else { 'Machine' }) (Get-EntryScopeLabel ([pscustomobject]@{ Hive = 'HKLM64'; Sid = $null })) 'scope: 64-bit view is said, not just "machine"'
+Assert-Equal $true ((Get-EntryScopeLabel ([pscustomobject]@{ Hive = 'HKU'; Sid = 'S-1-5-18' })) -like 'User (*)') 'scope: a user entry names its user'
+$apps = @(
+    [pscustomobject]@{ DisplayName = 'Bravo'; DisplayVersion = '9.12'; Publisher = 'B'; IsMsi = $true; Hive = 'HKLM64'; Sid = $null; InstallDate = [datetime]'2026-01-05'; SizeKB = 900 },
+    [pscustomobject]@{ DisplayName = 'alpha'; DisplayVersion = '10.2'; Publisher = 'A'; IsMsi = $false; Hive = 'HKLM32'; Sid = $null; InstallDate = $null; SizeKB = 120000 },
+    [pscustomobject]@{ DisplayName = 'Charlie'; DisplayVersion = ''; Publisher = 'C'; IsMsi = $false; Hive = 'HKLM64'; Sid = $null; InstallDate = [datetime]'2025-03-01'; SizeKB = $null })
+Assert-Equal 'alpha,Bravo,Charlie' ((Select-AppListRows $apps '' 0 $false | ForEach-Object { $_.DisplayName }) -join ',') 'list: by name, case-insensitive'
+Assert-Equal 'alpha,Bravo,Charlie' ((Select-AppListRows $apps '' 6 $true | ForEach-Object { $_.DisplayName }) -join ',') 'list: by size, biggest first, as numbers; no size goes last'
+Assert-Equal 'Bravo,alpha,Charlie' ((Select-AppListRows $apps '' 6 $false | ForEach-Object { $_.DisplayName }) -join ',') 'list: by size, smallest first; no size STILL last'
+Assert-Equal 'Bravo,Charlie,alpha' ((Select-AppListRows $apps '' 5 $true | ForEach-Object { $_.DisplayName }) -join ',') 'list: by date, newest first; no date last'
+Assert-Equal 'Bravo,alpha,Charlie' ((Select-AppListRows $apps '' 1 $false | ForEach-Object { $_.DisplayName }) -join ',') 'list: by version, part by part; no version last'
+Assert-Equal 'Charlie' ((Select-AppListRows $apps 'c' 0 $false | ForEach-Object { $_.DisplayName }) -join ',') 'list: the filter matches name or publisher'
+# The list itself, filled into a real ListView that is never shown.
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+$lv = New-Object System.Windows.Forms.ListView
+foreach ($c in @('Name', 'Version', 'Publisher', 'Type', 'Scope', 'Installed', 'Size')) { [void]$lv.Columns.Add($c, 60) }
+$fx = @($apps | ForEach-Object { $_ | Add-Member -NotePropertyName KeyPath -NotePropertyValue "k\$($_.DisplayName)" -PassThru | Add-Member -NotePropertyName InstallDateFromKey -NotePropertyValue ($_.DisplayName -eq 'Charlie') -PassThru })
+$lui = @{ Apps = $lv; Search = (New-Object System.Windows.Forms.TextBox); SortColumn = 6; SortDesc = $true; AppColumns = @('Name', 'Version', 'Publisher', 'Type', 'Scope', 'Installed', 'Size'); App = $null; Filling = $false }
+Update-AppList $lui $fx
+Assert-Equal 'alpha,Bravo,Charlie' ((@($lv.Items) | ForEach-Object { $_.Text }) -join ',') 'window list: sorted by size, biggest first'
+Assert-Equal ("{0}|{1}|" -f (Format-AppSize 120000), (Format-AppSize 900)) ((@($lv.Items) | ForEach-Object { $_.SubItems[6].Text }) -join '|') 'window list: the Size column'
+Assert-Equal ('Size ' + [char]0x25BC) $lv.Columns[6].Text 'window list: the sorted column shows its direction'
+Assert-Equal 'Name' $lv.Columns[0].Text 'window list: the other headers stay plain'
+Assert-Equal '2025-03-01' $lv.Items[2].SubItems[5].Text 'window list: the Installed column'
+Assert-Equal $true ($lv.Items[2].ToolTipText -like 'Grey date*') 'window list: a date from the key is marked as such'
+$lui.App = $fx[1]   # alpha selected, then the list re-sorted by name
+$lui.SortColumn = 0; $lui.SortDesc = $false
+Update-AppList $lui $fx
+# (Items' own Selected flag: SelectedItems stays empty on a ListView that never got a window handle.)
+Assert-Equal 'alpha' ((@($lv.Items) | Where-Object { $_.Selected } | ForEach-Object { $_.Text }) -join ',') 'window list: re-sorting keeps the selected app selected'
+Assert-Equal $false $lui.Filling 'window list: the selection handler is live again afterwards'
+$lv.Dispose()
+Assert-Equal 'C:\a' (Get-ParentPath 'C:\a\b') 'parent path'
+Assert-Equal 'C:\' (Get-ParentPath 'C:\a') 'parent of a top folder is the drive'
+Assert-Equal $null (Get-ParentPath 'C:\') 'the drive has no parent'
+Assert-Equal 2 (Get-PathDepth 'C:\a\b') 'path depth'
+Assert-Equal (Get-NormalizedPath '%ProgramFiles%\App\') (Get-NormalizedPath '%ProgramFiles%\App\') 'normalized path: the remembered answer is the same answer'
+$hp = Join-Path ([System.IO.Path]::GetTempPath()) ('killitwithfire-hp-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+try {
+    New-Item -ItemType Directory -Path (Join-Path $hp 'data\logs'), (Join-Path $hp 'prog\bin') -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $hp 'data\logs\today.log') -Value 'x'
+    Set-Content -LiteralPath (Join-Path $hp 'prog\bin\engine.dll') -Value 'x'
+    Assert-Equal $false (Test-HoldsProgramFiles (Join-Path $hp 'data')) 'a folder of logs holds no programs'
+    Assert-Equal $true (Test-HoldsProgramFiles (Join-Path $hp 'prog')) 'a folder with a .dll deep inside holds programs'
+    Assert-Equal $true (Test-HoldsProgramFiles (Join-Path $hp 'missing')) 'a folder that cannot be read counts as holding programs (doubt keeps)'
+} finally { Remove-Item -LiteralPath $hp -Recurse -Force -ErrorAction SilentlyContinue }
+
+# ---- the compiled MSI reader against Windows Installer's own COM reader, on a real cached MSI (read-only)
+$someMsi = Get-ChildItem -LiteralPath (Join-Path $env:SystemRoot 'Installer') -Filter *.msi -File -ErrorAction SilentlyContinue | Sort-Object Length | Select-Object -First 1
+if ($someMsi) {
+    $fast = [KillItWithFire.Fast]::MsiQuery($someMsi.FullName, 'SELECT `Property`, `Value` FROM `Property`', 2)
+    $wi = New-Object -ComObject WindowsInstaller.Installer
+    $db = Invoke-ComMember $wi 'OpenDatabase' 'InvokeMethod' @($someMsi.FullName, 0)
+    $v = Invoke-ComMember $db 'OpenView' 'InvokeMethod' @('SELECT `Property`, `Value` FROM `Property`')
+    [void](Invoke-ComMember $v 'Execute')
+    $com = @()
+    while ($null -ne ($rec = Invoke-ComMember $v 'Fetch')) { $com += ([string](Invoke-ComMember $rec 'StringData' 'GetProperty' @(1)) + '=' + [string](Invoke-ComMember $rec 'StringData' 'GetProperty' @(2))) }
+    [void](Invoke-ComMember $v 'Close')
+    Assert-Equal ($com -join '|') (($fast | ForEach-Object { $_[0] + '=' + $_[1] }) -join '|') "machine: compiled MSI reader = COM reader ($($someMsi.Name), $($com.Count) properties)"
+    Assert-Equal 0 @([KillItWithFire.Fast]::MsiQuery($someMsi.FullName, 'SELECT `Name` FROM `KillItWithFireNoSuchTable`', 1)).Count 'machine: a table the package lacks is no rows, not an error'
+} else { Write-Host 'note: no cached MSI on this machine; the MSI reader check was skipped' }
+
 Assert-Equal '"C:\IT Logs\\"' (ConvertTo-ArgvString 'C:\IT Logs\') 'argv: a trailing backslash is doubled before the closing quote'
 Assert-Equal '"a\"b"' (ConvertTo-ArgvString 'a"b') 'argv: an embedded quote is escaped'
 Assert-Equal '"x\\\"y z"' (ConvertTo-ArgvString 'x\"y z') 'argv: backslashes before an embedded quote are doubled'
@@ -479,7 +553,11 @@ try {
         Assert-Equal 'True,True,True,True' (@($s.levelsEnabled) -join ',') 'no policy: every level enabled'
         Assert-Equal 'Registration,LogonHooks,Drivers,Services,Files,Registry' ((@($s.categories) | ForEach-Object { ($_ -split ' ')[0] }) -join ',') 'checklist rows (user data has its own box; report-only rows never show)'
         Assert-Equal $true ((@($s.categories) | Where-Object { $_ -like 'Files*' }) -like '*50.0 MB*') 'checklist shows sizes'
-        Assert-Equal $true ((@($s.categories) | Where-Object { $_ -like 'Drivers*' }) -like '*+1 need review*') 'checklist counts review items apart'
+        Assert-Equal $true ((@($s.categories) | Where-Object { $_ -like 'Drivers*' }) -like '*+1 uncertain*') 'checklist counts uncertain (review) items apart'
+        Assert-Equal 'Also remove uncer&tain matches: 1' $s.reviewText 'the review box says what it is and how many, and stays off by default'
+        Assert-Equal 'Kill It With Fire - remove an app completely' $s.title 'window title'
+        Assert-Equal $true ([bool]$s.hasIcon) 'the window has its flame icon'
+        Assert-Equal 'Name|Version|Publisher|Type|Scope|Installed|Size' (@($s.appColumns) -join '|') 'app list columns: install date and size added'
         Assert-Equal ".\KillItWithFire.ps1 -ProductCode '{DDC95F26-92B1-4546-9678-5DC68DF76BA0}' -Level 3 -Force" $s.command 'equivalent command line'
         Assert-Equal $true ($s.userDataText -like '*1 item(s), 1.0 MB*') 'user data box shows what it would add'
         Assert-Equal $true ([bool]$s.cleanEnabled) 'Clean up enabled once a plan is loaded'
