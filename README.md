@@ -141,10 +141,19 @@ Identity first, never name first:
 - **Its folders**, from its own registration. A folder that another installed product also points into
   (or that sits inside another product's folder) is **shared**: inside it only the app's own files
   count, and the folder itself stays.
+- **A vendor folder holding another program.** An uninstall entry can name a whole vendor folder in which
+  another program lives that never registered itself (Epic Games Launcher's names `C:\Program Files\Epic
+  Games`, where Unreal Engine and the launcher's games are installed). For an app installed from an MSI,
+  the scan knows the app's own folders and removes only those; the vendor folder stays.
+  **For an app installed by an EXE it can't tell them apart: anything else inside that folder goes with
+  it.** The scan notes a folder that looks like a container of programs (no program files of its own,
+  programs in two or more subfolders), and the window shows the note in View items and again before a
+  full scrub. Check the Files items before you clean up such an app.
 - **Things that point at those folders or files:** services, drivers, tasks, Run keys, Active Setup,
   COM classes, shell extensions, context-menu verbs, file associations, credential providers, network
   providers, print monitors, firewall rules, shortcuts.
-- **Weak ties need review** and are left out unless `-IncludeReview`: a driver tied only by the vendor
+- **Weak ties are uncertain matches** and are left out unless `-IncludeReview` (in the window: "Also
+  remove uncertain matches"): a driver tied only by the vendor
   named in its version resource (never one that serves present hardware, never a boot driver, never
   when the vendor has other products installed), a logon DLL tied only by its signer, a file under
   `C:\Windows` that one MSI claims.

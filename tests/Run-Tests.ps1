@@ -377,6 +377,14 @@ try {
     Assert-Equal $false (Test-HoldsProgramFiles (Join-Path $hp 'data')) 'a folder of logs holds no programs'
     Assert-Equal $true (Test-HoldsProgramFiles (Join-Path $hp 'prog')) 'a folder with a .dll deep inside holds programs'
     Assert-Equal $true (Test-HoldsProgramFiles (Join-Path $hp 'missing')) 'a folder that cannot be read counts as holding programs (doubt keeps)'
+    # The EXE-install note: a vendor folder (programs only in subfolders) vs an app's own folder.
+    New-Item -ItemType Directory -Path (Join-Path $hp 'vendor\Launcher'), (Join-Path $hp 'vendor\UE_5.7\bin') -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $hp 'vendor\Launcher\launcher.exe') -Value 'x'
+    Set-Content -LiteralPath (Join-Path $hp 'vendor\UE_5.7\bin\editor.dll') -Value 'x'
+    Assert-Equal 'Launcher,UE_5.7' ((@(Get-ProgramContainerSubfolders (Join-Path $hp 'vendor')) | Sort-Object) -join ',') 'a vendor folder (programs only in subfolders) is noted'
+    Set-Content -LiteralPath (Join-Path $hp 'vendor\app.exe') -Value 'x'
+    Assert-Equal 0 @(Get-ProgramContainerSubfolders (Join-Path $hp 'vendor')).Count 'an app folder (its own program at the top) is not'
+    Assert-Equal 0 @(Get-ProgramContainerSubfolders (Join-Path $hp 'prog')).Count 'one subfolder of programs is not a container'
 } finally { Remove-Item -LiteralPath $hp -Recurse -Force -ErrorAction SilentlyContinue }
 
 # ---- the compiled MSI reader against Windows Installer's own COM reader, on a real cached MSI (read-only)

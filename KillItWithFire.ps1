@@ -487,6 +487,15 @@ function Test-HoldsProgramFiles {
     return $false
 }
 
+function Get-ProgramContainerSubfolders {
+    # A folder that looks like a CONTAINER of programs (a vendor folder): no .exe/.dll of its own at the top,
+    # and programs in two or more subfolders. Returns those subfolders' names, or nothing.
+    param([string] $Path)
+    if (@(Get-ChildItem -LiteralPath $Path -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Extension -match '^(?i)\.(exe|dll)$' }).Count) { return }
+    $dirs = @(Get-ChildItem -LiteralPath $Path -Directory -Force -ErrorAction SilentlyContinue | Where-Object { Test-HoldsProgramFiles $_.FullName } | ForEach-Object { $_.Name })
+    if ($dirs.Count -ge 2) { return $dirs }
+}
+
 function Get-ProtectedPathReason {
     # Why a folder may never be a root (matching OR removal), or $null when it can be one.
     # ContainerPaths: may not BE the root, but their children may (Program Files, a profile root).
@@ -1778,6 +1787,16 @@ function New-KillItWithFirePlan {
                 if ((Split-Path $f -Parent) -eq $s.Root.Path -and (Test-Path -LiteralPath $f -PathType Leaf)) { $identityFiles += [pscustomobject]@{ Path = $f; Component = $ourFileComponent[$f] } }
             }
             $script:Warnings.Add("$($s.Root.Path) also holds other programs ($names), so it stays: only the app's own folder(s) in it go ($(@($s.Ours | ForEach-Object { Split-Path $_ -Leaf }) -join ', ')).")
+        }
+    }
+    # An app installed by an EXE has no component list, so the split above can't run, and anything else in
+    # its folder goes with it. Say so when the folder looks like a container of programs: no program file of
+    # its own at the top, and programs in two or more subfolders (how Epic's vendor folder looks).
+    if (-not $ourCompDirs.Count) {
+        foreach ($r in @($roots | Where-Object { $_.Exists -and $_.Why -notlike 'MSI component*' })) {
+            $progDirs = @(Get-ProgramContainerSubfolders $r.Path)
+            if (-not $progDirs.Count) { continue }
+            $script:Warnings.Add("$($r.Path) has no program files of its own, only subfolders with programs ($(@($progDirs | Select-Object -First 4) -join ', ')): it may be a vendor folder holding other programs too. This app was not installed from an MSI, so the scan can't tell which subfolders are its own, and a full scrub takes the whole folder. Check the Files items (View items) first.")
         }
     }
 
@@ -4815,7 +4834,8 @@ function New-KillItWithFireForm {
         $ui.Unchecked = @{}
         # Scanning suggests the next step: registration cleanup when that is all the app has left.
         & $ui.Rebuild
-        $ui.Status.Text = "Scan of '$($PlanObject.target.displayName)': $(@($PlanObject.items).Count) item(s). Nothing has been changed."
+        $notes = @(Get-Prop $PlanObject 'warnings' | Where-Object { $_ }).Count
+        $ui.Status.Text = "Scan of '$($PlanObject.target.displayName)': $(@($PlanObject.items).Count) item(s)$(if ($notes) { ", $notes note(s) in View items" }). Nothing has been changed."
     }
 
     foreach ($rb in $levels) {
@@ -5031,6 +5051,15 @@ function Show-KillItWithFireGui {
             $dlg = New-Object System.Windows.Forms.Form; $dlg.Text = $(if ($g) { "Items: $g" } else { 'All items' }); $dlg.ClientSize = New-Object System.Drawing.Size(1000, 520); $dlg.StartPosition = 'CenterParent'; $dlg.Font = $ui.Form.Font; $dlg.Icon = $ui.Form.Icon
             $lv = New-Object System.Windows.Forms.ListView; $lv.Dock = 'Fill'; $lv.View = 'Details'; $lv.FullRowSelect = $true
             foreach ($c in @(@('Level', 44), @('Risk', 110), @('Target', 390), @('Action', 220), @('Why', 300))) { [void]$lv.Columns.Add($c[0], $c[1]) }
+            # The scan's notes first: the window showed none of them until 2026-10-04 (only the command line's
+            # report did), including "this folder also holds other programs".
+            foreach ($w in @(Get-Prop $ui.Plan 'warnings' | Where-Object { $_ })) {
+                $li = New-Object System.Windows.Forms.ListViewItem('!')
+                [void]$li.SubItems.Add('note'); [void]$li.SubItems.Add([string]$w); [void]$li.SubItems.Add(''); [void]$li.SubItems.Add('')
+                $li.ToolTipText = [string]$w
+                [void]$lv.Items.Add($li)
+            }
+            $lv.ShowItemToolTips = $true
             foreach ($i in @($ui.Plan.items | Where-Object { -not $g -or $_.group -eq $g })) {
                 $li = New-Object System.Windows.Forms.ListViewItem([string]$i.level)
                 [void]$li.SubItems.Add("$($i.risk)$(if ($i.review) { ', review' })$(if ($null -eq $i.op) { ', report only' })")
@@ -5047,7 +5076,14 @@ function Show-KillItWithFireGui {
             $msg = "Level $lvl ($(@('scan only', 'uninstall', 'registration cleanup', 'full scrub')[$lvl])) on '$($ui.Plan.target.displayName)'.`n`n"
             if ($lvl -ge 2) { $msg += "Categories: $(if ($keep.Count) { $keep -join ', ' } else { '(none)' })`n" }
             $msg += "The app's own uninstaller: $(if ($ui.KillIt.Checked) { 'SKIPPED - KILL IT scrubs the app out without it' } else { 'runs first' })`n"
-            $msg += "Backup: $(if ($ui.Backup.Checked) { 'yes, a restore can undo it' } else { 'NO - this run cannot be restored' })`n`nContinue?"
+            $msg += "Backup: $(if ($ui.Backup.Checked) { 'yes, a restore can undo it' } else { 'NO - this run cannot be restored' })`n"
+            # The scan's notes, at the last moment before a full scrub (a folder holding other programs, say).
+            $notes = @(Get-Prop $ui.Plan 'warnings' | Where-Object { $_ })
+            if ($lvl -ge 3 -and $notes.Count) {
+                $msg += "`nThe scan noted:`n" + ((@($notes | Select-Object -First 4) | ForEach-Object { "- $_" }) -join "`n") + "`n"
+                if ($notes.Count -gt 4) { $msg += "...and $($notes.Count - 4) more in View items.`n" }
+            }
+            $msg += "`nContinue?"
             if ([System.Windows.Forms.MessageBox]::Show($msg, 'Kill It With Fire', 'YesNo', 'Warning') -ne 'Yes') { return }
             $a = @('-Plan', $ui.PlanFile, '-Level', [string]$lvl, '-Force')
             if ($lvl -ge 2 -and $exclude.Count) { $a += @('-Exclude', ($exclude -join ',')) }
