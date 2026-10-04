@@ -558,6 +558,7 @@ try {
     Assert-Equal $true ($null -ne $s) 'window self-test ran (no policy)'
     if ($s) {
         Assert-Equal 3 $s.level 'no policy: the highest level is selectable and selected'
+        Assert-Equal 3 $s.levelAfterScan 'a scan moves the window to Full scrub by itself, so What to clean fills (it stayed empty at Scan only)'
         Assert-Equal 'True,True,True,True' (@($s.levelsEnabled) -join ',') 'no policy: every level enabled'
         Assert-Equal 'Registration,LogonHooks,Drivers,Services,Files,Registry' ((@($s.categories) | ForEach-Object { ($_ -split ' ')[0] }) -join ',') 'checklist rows (user data has its own box; report-only rows never show)'
         Assert-Equal $true ((@($s.categories) | Where-Object { $_ -like 'Files*' }) -like '*50.0 MB*') 'checklist shows sizes'
@@ -586,6 +587,7 @@ try {
         Assert-Equal 'True,True,True,False' (@($s.levelsEnabled) -join ',') 'MaxLevel 2 greys out Full scrub'
         Assert-Equal $false ([bool]$s.killItEnabled) 'MaxLevel 2 greys out KILL IT too (it is a full scrub)'
         Assert-Equal 2 $s.level 'the highest allowed level is selected'
+        Assert-Equal 2 $s.levelAfterScan 'a scan moves the window only as far as the policy allows'
         Assert-Equal 'True|False|True|False|\\srv\logs\|False|False' "$($s.backupChecked)|$($s.backupEnabled)|$($s.logChecked)|$($s.logEnabled)|$($s.logPath)|$($s.logPathEnabled)|$($s.userDataEnabled)" 'locked options are set and greyed out'
         Assert-Equal $true ($s.policyLabel -like 'Set by your administrator:*highest level 2*') 'the lock is labelled'
         Assert-Equal 'Registration' ((@($s.categories) | ForEach-Object { ($_ -split ' ')[0] }) -join ',') 'level 2 shows registration only'

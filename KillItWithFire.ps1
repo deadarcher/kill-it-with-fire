@@ -4819,6 +4819,7 @@ function New-KillItWithFireForm {
         if (-not $ui.Plan) { $ui.Description.Text = 'Scan an app, then choose Registration cleanup or Full scrub to pick what goes.' }
         elseif ($lvl -lt 2) { $ui.Description.Text = "Pick Registration cleanup or Full scrub to choose what goes. The scan found $(@($ui.Plan.items).Count) item(s)." }
         elseif (-not $ui.Categories.Items.Count) { $ui.Description.Text = 'Nothing to clean at this level.' }
+        else { $ui.Description.Text = "Everything ticked goes when you press Clean up (it asks first). Untick a category to keep it, select one to see what it is, or View items for each item and the scan's notes." }
         # Strict mode: a property of $null throws, so no plan means no items, not $ui.Plan.items.
         $planItems = if ($ui.Plan) { @($ui.Plan.items) } else { @() }
         $ud = @($planItems | Where-Object { $_.group -eq 'UserData' -and $_.level -le $lvl })
@@ -4832,10 +4833,14 @@ function New-KillItWithFireForm {
         param($PlanObject)
         $ui.Plan = $PlanObject
         $ui.Unchecked = @{}
-        # Scanning suggests the next step: registration cleanup when that is all the app has left.
+        # A scan moves the level to the furthest the policy allows, so "3. What to clean" fills at once with what
+        # the scan found. Left at Scan only, the list stayed EMPTY after a scan and the window read as broken
+        # (first outside try, 2026-10-04). Nothing runs until Clean up, which asks first.
+        $max = if ($null -ne $ui.Policy.MaxLevel) { [Math]::Min(3, [int]$ui.Policy.MaxLevel) } else { 3 }
+        if ($max -ge 2 -and -not (Get-Prop $PlanObject 'refused')) { $ui.Levels[$max].Checked = $true }
         & $ui.Rebuild
         $notes = @(Get-Prop $PlanObject 'warnings' | Where-Object { $_ }).Count
-        $ui.Status.Text = "Scan of '$($PlanObject.target.displayName)': $(@($PlanObject.items).Count) item(s)$(if ($notes) { ", $notes note(s) in View items" }). Nothing has been changed."
+        $ui.Status.Text = "Scanned '$($PlanObject.target.displayName)': $(@($PlanObject.items).Count) item(s)$(if ($notes) { ", $notes note(s)" }). Nothing changed yet."
     }
 
     foreach ($rb in $levels) {
@@ -5138,6 +5143,7 @@ function Invoke-GuiSelfTest {
     $ui.Form.Show()
     [System.Windows.Forms.Application]::DoEvents()
     $max = if ($null -ne $Policy.MaxLevel) { [Math]::Min(3, [int]$Policy.MaxLevel) } else { 3 }
+    $levelAfterScan = & $ui.GetLevel   # what loading a scan selected by itself, before this test touches it
     if ($ui.Plan) { $ui.Levels[$max].Checked = $true }
     if ($ui.Categories.Items.Count) { $ui.Categories.SelectedIndex = 0 }
     [System.Windows.Forms.Application]::DoEvents()
@@ -5153,7 +5159,7 @@ function Invoke-GuiSelfTest {
         killItChecked = $ui.KillIt.Checked; cleanText = $ui.Clean.Text; userDataEnabled = $ui.UserData.Enabled; userDataText = $ui.UserData.Text; reviewText = $ui.Review.Text; policyLabel = $ui.PolicyLabel.Text
         categories = @($ui.Categories.Items | ForEach-Object { [string]$_ }); categoriesEnabled = $ui.Categories.Enabled; description = $ui.Description.Text
         command = $ui.Command.Text; cleanEnabled = $ui.Clean.Enabled; killItEnabled = $ui.KillIt.Enabled; killIt = $null
-        title = $ui.Form.Text; hasIcon = ($null -ne $script:WindowIcon -and [object]::ReferenceEquals($ui.Form.Icon, $script:WindowIcon)); appColumns = @($ui.Apps.Columns | ForEach-Object { $_.Text })
+        levelAfterScan = $levelAfterScan; title = $ui.Form.Text; hasIcon = ($null -ne $script:WindowIcon -and [object]::ReferenceEquals($ui.Form.Icon, $script:WindowIcon)); appColumns = @($ui.Apps.Columns | ForEach-Object { $_.Text })
     }
     # The KILL IT wiring: from Scan only, ticking it must jump to Full scrub, say -KillIt, and relabel the
     # button; dropping back to level 1 must untick it (there is nothing to kill there).
