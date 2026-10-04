@@ -221,6 +221,22 @@ try {
     $innoByName = & $stub 'unins000.exe' 'nothing'
     $c = Get-UninstallCommand (& $t @{ uninstallString = "`"$innoByName`"" })
     Assert-Equal '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART' $c.Args 'Inno: unins000.exe gets its silent switches by name'
+    # TreeSize Free registers QuietUninstallString "unins000.exe /SILENT", which still asks Yes/No (even with
+    # /SUPPRESSMSGBOXES): it sat ten minutes on an invisible prompt (lab sweep, 2026-10-03).
+    $inno = & $stub 'unins001.exe' 'Inno Setup Setup Data'
+    $c = Get-UninstallCommand (& $t @{ quietUninstallString = "`"$inno`" /SILENT"; uninstallString = "`"$inno`"" })
+    Assert-Equal '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART' $c.Args 'Inno quiet string of just /SILENT: made fully silent, and no surprise restart'
+    $c = Get-UninstallCommand (& $t @{ quietUninstallString = "`"$inno`" /SILENT /SUPPRESSMSGBOXES /LOG" })
+    Assert-Equal '/VERYSILENT /SUPPRESSMSGBOXES /LOG /NORESTART' $c.Args 'Inno: /SILENT upgraded in place, the vendor''s other switches kept'
+    $c = Get-UninstallCommand (& $t @{ quietUninstallString = "`"$inno`" /VERYSILENT /SUPPRESSMSGBOXES" })
+    Assert-Equal '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART' $c.Args 'Inno: /NORESTART comes with suppressed message boxes (their restart default is Yes)'
+    $c = Get-UninstallCommand (& $t @{ quietUninstallString = "`"$inno`" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART" })
+    Assert-Equal '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART' $c.Args 'Inno: a complete quiet string runs as the vendor wrote it'
+    $c = Get-UninstallCommand (& $t @{ uninstallString = "`"$inno`" /silent" })
+    Assert-Equal '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART' $c.Args 'Inno UninstallString carrying /silent: completed and run, not skipped'
+    $innoAnyName = & $stub 'uninstall-app.exe' 'Inno Setup Setup Data'
+    $c = Get-UninstallCommand (& $t @{ quietUninstallString = "`"$innoAnyName`" /SILENT" })
+    Assert-Equal '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART' $c.Args 'Inno by its marker, whatever the file is called'
     $burn = & $stub 'setup.exe' '.wixburn'
     $c = Get-UninstallCommand (& $t @{ uninstallString = "`"$burn`" /uninstall" })
     Assert-Equal '/uninstall /quiet /norestart' $c.Args 'Burn: a bare /uninstall is completed with /quiet'
@@ -229,6 +245,8 @@ try {
     $plain = & $stub 'remove.exe' 'nothing'
     $c = Get-UninstallCommand (& $t @{ uninstallString = "`"$plain`" /remove" })
     Assert-Equal $true ([bool]$c.Skip -and -not $c.Exe) 'unknown engine with switches: skipped, never run (it would wait for a click)'
+    $c = Get-UninstallCommand (& $t @{ quietUninstallString = "`"$plain`" /SILENT" })
+    Assert-Equal '/SILENT' $c.Args 'Inno''s switches are never added to an uninstaller that is not Inno'
     $c = Get-UninstallCommand (& $t @{ uninstallString = "`"$(Join-Path $fp 'gone.exe')`"" })
     Assert-Equal $true ([bool]$c.Fail -and -not $c.Exe) 'a deleted uninstaller fails without running anything'
     $c = Get-UninstallCommand (& $t @{ uninstallString = "`"$nsis`""; entrySid = 'S-1-5-21-1-2-3-9999' })
@@ -252,6 +270,56 @@ try {
     $c = Get-UninstallCommand (& $t @{ uninstallString = "`"$nsis`""; entrySid = $me })
     Assert-Equal "/S _?=$fp" $c.Args 'our own per-user entry: its uninstaller runs'
 } finally { Remove-Item -LiteralPath $fp -Recurse -Force -ErrorAction SilentlyContinue }
+
+# ---- level 1's wait: real processes. A prompt nobody can answer is found and stopped early; a clean exit
+# returns at once; a child that outlives its parent is waited for; the ceiling stops the whole tree.
+Assert-Equal $false (Test-PromptUnseen -Visible $true -Interactive $true -Session 1) 'prompt on screen in a signed-in session: someone can answer it'
+Assert-Equal $true (Test-PromptUnseen -Visible $false -Interactive $true -Session 1) 'prompt off screen: nobody can answer it'
+Assert-Equal $true (Test-PromptUnseen -Visible $true -Interactive $false -Session 1) 'not interactive: nobody can answer it'
+Assert-Equal $true (Test-PromptUnseen -Visible $true -Interactive $true -Session 0) 'session 0 (RMM, SYSTEM): nobody can answer it'
+$hostExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$unseen = { param($v) $true }
+# The prompt is a real dialog-class (#32770) window with Static text and Yes/No buttons, built WITHOUT
+# WS_VISIBLE. NOT a MessageBox: one from a hidden-started process still shows on the desktop of whoever
+# runs these tests (checked 2026-10-03, it popped up on the dev machine).
+$box = @'
+Add-Type -Namespace T -Name U -MemberDefinition '[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr CreateWindowExW(int ex, string cls, string name, int style, int x, int y, int w, int h, IntPtr parent, IntPtr menu, IntPtr inst, IntPtr param);'
+$z = [IntPtr]::Zero
+$d = [T.U]::CreateWindowExW(0, '#32770', 'Uninstall', 0x00C00000, 0, 0, 300, 200, $z, $z, $z, $z)
+[void][T.U]::CreateWindowExW(0, 'Static', 'Would you like your application settings to be deleted too?', 0x40000000, 10, 10, 280, 20, $d, $z, $z, $z)
+[void][T.U]::CreateWindowExW(0, 'Button', '&Yes', 0x40000000, 10, 40, 80, 24, $d, $z, $z, $z)
+[void][T.U]::CreateWindowExW(0, 'Button', '&No', 0x40000000, 100, 40, 80, 24, $d, $z, $z, $z)
+Start-Sleep -Seconds 120
+'@
+$p = Start-Process -FilePath $hostExe -ArgumentList @('-NoProfile', '-EncodedCommand', [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($box))) -PassThru -WindowStyle Hidden
+$null = $p.Handle
+$t0 = Get-Date
+$w = Wait-Uninstaller -Process $p -Target $null -CeilingSec 90 -IdleSec 3 -PollSec 1 -IsUnseen $unseen
+Assert-Equal $true ([string]$w.Stopped -like '*prompt nobody can answer: Uninstall: Would you like your application settings to be deleted too? `[Yes/No`]*') "level 1: an unanswerable Yes/No is found, with its text ($($w.Stopped))"
+Assert-Equal $true (((Get-Date) - $t0).TotalSeconds -lt 60) 'level 1: ... and stopped well before the ceiling'
+Assert-Equal $true ($p.WaitForExit(5000)) 'level 1: ... and the prompting process is gone'
+$p = Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList '/d /c exit 0' -PassThru -WindowStyle Hidden
+$null = $p.Handle
+$t0 = Get-Date
+$w = Wait-Uninstaller -Process $p -Target $null -CeilingSec 60 -IdleSec 3 -PollSec 1 -IsUnseen $unseen
+Assert-Equal $true ($null -eq $w.Stopped -and $null -eq $w.Note -and ((Get-Date) - $t0).TotalSeconds -lt 10) 'level 1: a clean exit with nothing left running returns at once'
+$p = Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList '/d /c exit 1603' -PassThru -WindowStyle Hidden
+$null = $p.Handle
+$w = Wait-Uninstaller -Process $p -Target $null -CeilingSec 60 -IdleSec 3 -PollSec 1 -IsUnseen $unseen
+Assert-Equal $true ($null -eq $w.Stopped -and $p.ExitCode -eq 1603) 'level 1: a failed uninstaller returns its own code, not a stop'
+# A copy that does the work after its parent exits (Inno's second phase, NSIS's Au_.exe).
+$p = Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList "/d /c start `"`" /b `"$hostExe`" -NoProfile -Command Start-Sleep 5" -PassThru -WindowStyle Hidden
+$null = $p.Handle
+$t0 = Get-Date
+$w = Wait-Uninstaller -Process $p -Target $null -CeilingSec 60 -IdleSec 30 -PollSec 1 -IsUnseen $unseen
+$took = ((Get-Date) - $t0).TotalSeconds
+Assert-Equal $true ($null -eq $w.Stopped -and $took -ge 3.5 -and $took -lt 15) "level 1: a child that outlives the uninstaller is waited for ($([int]$took) s)"
+$p = Start-Process -FilePath $hostExe -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep 60') -PassThru -WindowStyle Hidden
+$null = $p.Handle
+$w = Wait-Uninstaller -Process $p -Target $null -CeilingSec 4 -IdleSec 30 -PollSec 1 -IsUnseen $unseen
+Assert-Equal $true ([string]$w.Stopped -like 'timed out after 4 s*') "level 1: the ceiling stops it ($($w.Stopped))"
+Assert-Equal $true ($p.WaitForExit(5000)) 'level 1: ... and the timed-out process is gone'
+
 Assert-Equal '"C:\IT Logs\\"' (ConvertTo-ArgvString 'C:\IT Logs\') 'argv: a trailing backslash is doubled before the closing quote'
 Assert-Equal '"a\"b"' (ConvertTo-ArgvString 'a"b') 'argv: an embedded quote is escaped'
 Assert-Equal '"x\\\"y z"' (ConvertTo-ArgvString 'x\"y z') 'argv: backslashes before an embedded quote are doubled'
@@ -518,6 +586,41 @@ if ([Environment]::Is64BitOperatingSystem) {
     Assert-Equal (Get-KeyNativePath 'HKLM64' 'SOFTWARE\Classes\.txt') (Get-KeyNativePath 'HKLM32' 'SOFTWARE\Classes\.txt') 'machine: file extensions are shared between the views'
     Assert-Equal 'HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall' (Format-RegPath 'HKLM32' 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall') 'machine: the 32-bit uninstall key is redirected'
     Assert-Equal $null (Get-KeyNativePath 'HKLM64' 'SOFTWARE\KillItWithFire-no-such-key-7f3a') 'machine: a missing key has no native path'
+}
+
+# ---- a ProgID's guard: delete it while it points at our class, or (once the app's own uninstaller cut
+# that link) at nothing but what the scan saw pointing at the app. Foxit PDF Reader left four such keys
+# (lab sweep, 2026-10-03). A scratch key in this user's own hive, removed again at the end.
+$me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$tk = "$me\Software\KillItWithFire-Test-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+$hkuBase = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::Users, [Microsoft.Win32.RegistryView]::Registry64)
+try {
+    $pk = "$tk\App.Document"
+    $k = $hkuBase.CreateSubKey("$pk\CLSID"); $k.SetValue('', '{11111111-2222-3333-4444-555555555555}'); $k.Close()
+    $k = $hkuBase.CreateSubKey("$pk\DefaultIcon"); $k.SetValue('', 'C:\App\app.exe,1'); $k.Close()
+    $k = $hkuBase.CreateSubKey("$pk\shell\open\command"); $k.SetValue('', '"C:\App\app.exe" "%1"'); $k.Close()
+    $refs = Get-ProgIdRefs 'HKU' $pk
+    Assert-Equal 'DefaultIcon=C:\App\app.exe,1|shell\open\command="C:\App\app.exe" "%1"' ((@($refs.Keys) | Sort-Object | ForEach-Object { "$_=$($refs[$_])" }) -join '|') 'ProgID refs: its icon and every verb command'
+    $exp = @{ sub = 'CLSID'; value = '{11111111-2222-3333-4444-555555555555}'; orphanRefs = $refs }
+    $expJson = $exp | ConvertTo-Json -Depth 4 | ConvertFrom-Json
+    $old = @{ sub = 'CLSID'; value = '{11111111-2222-3333-4444-555555555555}' }
+    Assert-Equal $true (Test-KeyExpectation 'HKU' $pk $exp) 'ProgID: still points at our class'
+    $hkuBase.DeleteSubKeyTree("$pk\CLSID")
+    Assert-Equal $true (Test-KeyExpectation 'HKU' $pk $exp) 'ProgID: CLSID link cut by the uninstaller, the rest as the scan saw it: ours'
+    Assert-Equal $true (Test-KeyExpectation 'HKU' $pk $expJson) '... the same from a plan.json read back'
+    Assert-Equal $false (Test-KeyExpectation 'HKU' $pk $old) '... but never under an older plan without orphanRefs'
+    $hkuBase.DeleteSubKeyTree("$pk\DefaultIcon")
+    Assert-Equal $true (Test-KeyExpectation 'HKU' $pk $exp) 'ProgID: less of it left than the scan saw is still ours'
+    $k = $hkuBase.CreateSubKey("$pk\shell\edit\command"); $k.SetValue('', '"C:\Other\editor.exe" "%1"'); $k.Close()
+    Assert-Equal $false (Test-KeyExpectation 'HKU' $pk $exp) 'ProgID: a verb that was not there at the scan means someone else uses it: kept'
+    $hkuBase.DeleteSubKeyTree("$pk\shell\edit")
+    $k = $hkuBase.CreateSubKey("$pk\shell\open\command"); $k.SetValue('', '"C:\Other\viewer.exe" "%1"'); $k.Close()
+    Assert-Equal $false (Test-KeyExpectation 'HKU' $pk $exp) 'ProgID: its open command now runs another program: kept'
+    $k = $hkuBase.CreateSubKey("$pk\CLSID"); $k.SetValue('', '{99999999-2222-3333-4444-555555555555}'); $k.Close()
+    Assert-Equal $false (Test-KeyExpectation 'HKU' $pk $exp) 'ProgID: re-pointed at another class: kept'
+} finally {
+    try { $hkuBase.DeleteSubKeyTree($tk, $false) } catch { }
+    $hkuBase.Close()
 }
 
 Write-Host ("{0} passed, {1} failed ({2})" -f $script:pass, $script:fail, $PSVersionTable.PSVersion)

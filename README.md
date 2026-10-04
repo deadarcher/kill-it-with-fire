@@ -12,7 +12,9 @@ Removes a Windows app completely, the proper way or the hard way:
   left behind is cleaned up. For an MSI that is `msiexec /x`. For an EXE it is the app's registered quiet
   uninstall command, or the silent switch of the engine that built its uninstaller (NSIS, Inno Setup,
   WiX Burn, InstallShield, InstallAware), recognised from markers inside the uninstaller itself. An
-  uninstaller with no known silent switch is skipped rather than left waiting for a click.
+  uninstaller with no known silent switch is skipped rather than left waiting for a click, and one that
+  stops on a prompt nobody can see anyway (a "quiet" command that still asks Yes/No) is stopped after a
+  minute of waiting on it, with the prompt's text in the log. The cleanup then does the rest.
 - **KILL IT** (`-KillIt`, or the KILL IT box in the window): skip the uninstaller and scrub the app out.
   For an uninstaller that is broken, hangs, or wants a click nobody is there to give.
 

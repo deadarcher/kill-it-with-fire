@@ -1953,9 +1953,14 @@ function New-KillItWithFirePlan {
                             -Action 'delete key' -Evidence "$server = $val (points at the app)" -Op (New-RegOp -Kind 'RegDeleteKey' -Hive $src.Hive -Path "$($src.Path)\CLSID\$clsid"))
                     if ($progId) {
                         [void]$ourClassKeys.Add($progId)
+                        # What else the ProgID points at. When all of it is the app's, the key may also go once
+                        # the app's own uninstaller has cut its CLSID link (Test-KeyExpectation).
+                        $expect = @{ sub = 'CLSID'; value = $clsid }
+                        $refs = Get-ProgIdRefs $src.Hive "$($src.Path)\$progId"
+                        if (-not @($refs.Values | Where-Object { -not (Test-OurReference $_) }).Count) { $expect.orphanRefs = $refs }
                         [void](Add-PlanItem -Category 'ComProgId' -Level 3 -Scope $src.Scope -Target (Format-RegPath $src.Hive "$($src.Path)\$progId") `
-                                -Action 'delete key (only if its CLSID still points at our class)' -Evidence "ProgID of our class $clsid" `
-                                -Op (New-RegOp -Kind 'RegDeleteKey' -Hive $src.Hive -Path "$($src.Path)\$progId" -Expect @{ sub = 'CLSID'; value = $clsid } -Optional))
+                                -Action 'delete key (only while it still points at our class, or at nothing else)' -Evidence "ProgID of our class $clsid" `
+                                -Op (New-RegOp -Kind 'RegDeleteKey' -Hive $src.Hive -Path "$($src.Path)\$progId" -Expect $expect -Optional))
                     }
                     if ($appIdOfClass -and (Test-IsGuid $appIdOfClass)) { $pendingAppIds += [pscustomobject]@{ Src = $src; AppId = $appIdOfClass; Clsid = $clsid } }
                     break
@@ -3034,6 +3039,52 @@ public static string GetKeyName(IntPtr keyHandle) {
 }
 '@
 }
+# Its own type, not more members on Native: a session that loaded an older Native keeps it (the type can't
+# be reloaded), and would then lack this.
+if (-not ('KillItWithFire.Prompt' -as [type])) {
+    Add-Type -Namespace KillItWithFire -Name Prompt -MemberDefinition @'
+public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
+[DllImport("user32.dll")] private static extern bool EnumWindows(EnumProc f, IntPtr l);
+[DllImport("user32.dll")] private static extern bool EnumChildWindows(IntPtr parent, EnumProc f, IntPtr l);
+[DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowTextW(IntPtr h, System.Text.StringBuilder s, int n);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassNameW(IntPtr h, System.Text.StringBuilder s, int n);
+[DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr h);
+// A dialog (class #32770: message boxes and most installer prompts) that one of these processes owns and
+// that carries a button besides Cancel (a progress window has only Cancel): something waits for a click.
+// Returns "title: text [Yes/No]", or null. visible = whether the dialog is on screen at all.
+public static string FindPrompt(int[] pids, out bool visible) {
+    var set = new System.Collections.Generic.HashSet<uint>();
+    foreach (int p in pids) { set.Add((uint)p); }
+    string found = null; bool vis = false;
+    EnumWindows(delegate (IntPtr h, IntPtr l) {
+        uint pid; GetWindowThreadProcessId(h, out pid);
+        if (!set.Contains(pid)) { return true; }
+        var cls = new System.Text.StringBuilder(64); GetClassNameW(h, cls, 64);
+        if (cls.ToString() != "#32770") { return true; }
+        var title = new System.Text.StringBuilder(256); GetWindowTextW(h, title, 256);
+        var texts = new System.Collections.Generic.List<string>();
+        var buttons = new System.Collections.Generic.List<string>();
+        EnumChildWindows(h, delegate (IntPtr c, IntPtr l2) {
+            var cc = new System.Text.StringBuilder(64); GetClassNameW(c, cc, 64);
+            var ct = new System.Text.StringBuilder(1024); GetWindowTextW(c, ct, 1024);
+            string t = ct.ToString().Trim();
+            if (t.Length == 0) { return true; }
+            if (cc.ToString() == "Button") { buttons.Add(t.Replace("&", "")); } else if (cc.ToString() == "Static") { texts.Add(t); }
+            return true;
+        }, IntPtr.Zero);
+        bool waits = false;
+        foreach (string b in buttons) { if (!b.Equals("Cancel", StringComparison.OrdinalIgnoreCase)) { waits = true; } }
+        if (!waits) { return true; }
+        found = (title.Length > 0 ? title.ToString() + ": " : "") + string.Join(" ", texts.ToArray()) + " [" + string.Join("/", buttons.ToArray()) + "]";
+        vis = IsWindowVisible(h);
+        return false;
+    }, IntPtr.Zero);
+    visible = vis;
+    return found;
+}
+'@
+}
 
 function Move-PathOrSchedule {
     # Move now if possible; a file in use is scheduled to move at the next boot (still into the
@@ -3120,13 +3171,53 @@ function Export-RegKeyBackup {
     if ($r.Code -ne 0 -or -not (Test-Path -LiteralPath $File)) { throw "reg export of $phys failed: $($r.Output)" }
 }
 
+function Get-ProgIdRefs {
+    # What a ProgID points at besides its class: DefaultIcon and every shell\<verb>\command, as
+    # @{ 'DefaultIcon' = ...; 'shell\open\command' = ... } (only the ones with a value).
+    param([string] $Hive, [string] $Path)
+    $refs = @{}
+    $k = Open-Key $Hive "$Path\DefaultIcon"
+    $v = [string](Get-ValueSafe $k ''); Close-Key $k
+    if ($v) { $refs['DefaultIcon'] = $v }
+    $sh = Open-Key $Hive "$Path\shell"
+    foreach ($verb in (Get-SubKeyNamesSafe $sh)) {
+        $ck = Open-Key $Hive "$Path\shell\$verb\command"
+        $v = [string](Get-ValueSafe $ck ''); Close-Key $ck
+        if ($v) { $refs["shell\$verb\command"] = $v }
+    }
+    Close-Key $sh
+    return $refs
+}
+
+function ConvertTo-StringMap {
+    # A hashtable from a plan's own hashtable, or from the PSCustomObject the same thing reads back as
+    # from plan.json.
+    param($O)
+    $h = @{}
+    if ($null -eq $O) { return $h }
+    if ($O -is [System.Collections.IDictionary]) { foreach ($k in $O.Keys) { $h[[string]$k] = [string]$O[$k] } }
+    else { foreach ($p in $O.PSObject.Properties) { $h[$p.Name] = [string]$p.Value } }
+    return $h
+}
+
 function Test-KeyExpectation {
     param([string] $Hive, [string] $Path, $Expect)
     if (-not $Expect) { return $true }
     $k = Open-Key $Hive "$Path\$($Expect.sub)"
     $v = [string](Get-ValueSafe $k '')
     Close-Key $k
-    return ($v.Trim().Equals(([string]$Expect.value).Trim(), [StringComparison]::OrdinalIgnoreCase))
+    if ($v.Trim()) { return ($v.Trim().Equals(([string]$Expect.value).Trim(), [StringComparison]::OrdinalIgnoreCase)) }
+    # The CLSID link is gone: the app's own uninstaller took it and left the rest of the ProgID behind
+    # (Foxit PDF Reader's four FoxitReader.* keys, lab sweep 2026-10-03). Still ours only when the scan saw
+    # every command and icon in it pointing at the app (orphanRefs), and nothing new has moved in since.
+    $refs = Get-Prop $Expect 'orphanRefs'
+    if ($null -eq $refs) { return $false }
+    $seen = ConvertTo-StringMap $refs
+    $now = Get-ProgIdRefs $Hive $Path
+    foreach ($sub in @($now.Keys)) {
+        if (-not $seen.ContainsKey($sub) -or -not ([string]$seen[$sub]).Equals([string]$now[$sub], [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    }
+    return $true
 }
 
 function Invoke-ScExe {
@@ -3510,6 +3601,20 @@ function Get-UninstallCommand {
         }
         return (New-UninstallCommand -Exe $exe -Arguments $args0 -How "NSIS, in place (from the $from)")
     }
+    # Inno: /SILENT is not silent. TreeSize Free's QuietUninstallString is just "/SILENT", and it sat ten
+    # minutes on an invisible "delete your settings too? Yes/No" (lab sweep, 2026-10-03); /SILENT plus
+    # /SUPPRESSMSGBOXES STILL asked (measured in the lab). Only /VERYSILENT, the agent's Inno switch, ran it
+    # through. /SUPPRESSMSGBOXES answers Inno's own boxes with its documented defaults, and /NORESTART must
+    # come with it: one of those defaults is "Yes, restart now".
+    $isInno = ($engine -eq 'InnoSetup') -or ((Split-Path $exe -Leaf) -match '^(?i)unins\d+\.exe$')
+    if ($isInno -and $args0 -match '(?i)(^|\s)/(VERY)?SILENT\b') {
+        $a = $args0
+        if ($a -notmatch '(?i)(^|\s)/VERYSILENT\b') { $a = [regex]::Replace($a, '(?i)(^|\s)/SILENT\b', '$1/VERYSILENT') }
+        if ($a -notmatch '(?i)(^|\s)/SUPPRESSMSGBOXES\b') { $a += ' /SUPPRESSMSGBOXES' }
+        if ($a -notmatch '(?i)(^|\s)/NORESTART\b') { $a += ' /NORESTART' }
+        if ($a -ne $args0) { return (New-UninstallCommand -Exe $exe -Arguments $a -How "the $from, made fully silent for Inno (its /SILENT still asks questions)") }
+        return (New-UninstallCommand -Exe $exe -Arguments $args0 -How "the $from")
+    }
     if ($from -eq 'QuietUninstallString') { return (New-UninstallCommand -Exe $exe -Arguments $args0 -How 'the QuietUninstallString') }
     # An UninstallString: add the engine's silent switch only when it carries none (the agent's rule: never
     # second-guess switches the vendor wrote), and complete WiX Burn's "/uninstall", which alone is interactive.
@@ -3534,6 +3639,91 @@ function Test-UninstallEntryPresent {
     return $false
 }
 
+function Get-ProcessTreeSince {
+    # A process and everything it started, by parent id. A child outlives its parent and keeps the parent's
+    # id as its ParentProcessId: that is how Inno's _unins.tmp and NSIS's Au_.exe are found once the
+    # uninstaller that started them is gone. One created before the root is a reused id, never a child.
+    param([int] $Root, [datetime] $Since)
+    $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+    $ids = New-Object 'System.Collections.Generic.HashSet[int]'
+    [void]$ids.Add($Root)
+    $grew = $true
+    while ($grew) {
+        $grew = $false
+        foreach ($q in $all) {
+            if ($ids.Contains([int]$q.ParentProcessId) -and $q.CreationDate -ge $Since -and $ids.Add([int]$q.ProcessId)) { $grew = $true }
+        }
+    }
+    return @($all | Where-Object { $ids.Contains([int]$_.ProcessId) })
+}
+
+function Test-PromptUnseen {
+    # Can anyone answer a prompt? Not one that is off screen, and not anything on session 0 (an RMM or
+    # SYSTEM run), where no one sees anything. One a signed-in user can see is theirs to answer.
+    param([bool] $Visible, [bool] $Interactive, [int] $Session)
+    return (-not $Visible) -or (-not $Interactive) -or ($Session -eq 0)
+}
+
+function Stop-ProcessTreeSince {
+    # The newest first, so nothing is left re-parented and running.
+    param($Tree)
+    foreach ($q in @($Tree | Sort-Object CreationDate -Descending)) { try { Stop-Process -Id ([int]$q.ProcessId) -Force -ErrorAction Stop } catch { } }
+}
+
+function Wait-Uninstaller {
+    # Level 1's wait: the uninstaller, then (after a clean exit) what it left running and its own uninstall
+    # entry, because Inno's second phase and NSIS's Au_.exe do the work in a copy and the scrub must not race
+    # them. Gives up EARLY on a prompt nobody can answer: a dialog with a button besides Cancel, unseen
+    # (Test-PromptUnseen), while the whole tree has used no CPU for IdleSec. Waiting longer cannot help, and
+    # TreeSize Free's sat the full ten minutes on one (lab sweep, 2026-10-03).
+    # Returns @{ Stopped = why it was stopped, or $null; Note = what the scrub should know, or $null }.
+    param($Process, $Target, [int] $CeilingSec = 600, [int] $AfterSec = 90, [int] $IdleSec = 60, [int] $PollSec = 2,
+        [scriptblock] $IsUnseen = { param($v) Test-PromptUnseen -Visible $v -Interactive ([Environment]::UserInteractive) -Session ((Get-Process -Id $PID).SessionId) })
+    $since = try { $Process.StartTime.AddSeconds(-1) } catch { (Get-Date).AddSeconds(-5) }
+    $start = Get-Date
+    $cleanExit = $null
+    $idleSince = $null; $lastCpu = -1.0
+    while ($true) {
+        $tree = @(Get-ProcessTreeSince $Process.Id $since)
+        $exited = $Process.HasExited
+        $running = @($tree | Where-Object { [int]$_.ProcessId -ne $Process.Id -or -not $exited })
+        if ($exited -and -not $cleanExit) {
+            if ($Process.ExitCode -notin @(0, 3010)) { return @{ Stopped = $null; Note = $null } }
+            $cleanExit = Get-Date
+        }
+        if ($cleanExit) {
+            # Its own uninstall entry going is the signal that the work is done (the full AfterSec). What it
+            # left running only gets a short grace: an uninstaller may open a survey page in a browser.
+            $entry = [bool]($Target -and (Test-UninstallEntryPresent $Target))
+            $waited = ((Get-Date) - $cleanExit).TotalSeconds
+            if (-not $entry -and (-not $running.Count -or $waited -ge 15)) { return @{ Stopped = $null; Note = $null } }
+            if ($waited -ge $AfterSec) {
+                $still = if ($running.Count) { " ($(@($running | ForEach-Object { $_.Name } | Select-Object -Unique) -join ', ') still running)" } else { '' }
+                return @{ Stopped = $null; Note = "its uninstall entry is still there after $AfterSec s$still, so the scrub removes what is left" }
+            }
+        } elseif (((Get-Date) - $start).TotalSeconds -ge $CeilingSec) {
+            $v = $false
+            $pr = [KillItWithFire.Prompt]::FindPrompt([int[]]@($tree | ForEach-Object { [int]$_.ProcessId }), [ref]$v)
+            Stop-ProcessTreeSince $tree
+            $ceil = if ($CeilingSec % 60) { "$CeilingSec s" } else { "$([int]($CeilingSec / 60)) minutes" }
+            return @{ Stopped = "timed out after $ceil$(if ($pr) { "; it was waiting on: $pr" })"; Note = $null }
+        }
+        $cpu = 0.0
+        foreach ($q in $running) { $cpu += ([double]$q.KernelModeTime + [double]$q.UserModeTime) / 1e7 }
+        if ($running.Count -and $lastCpu -ge 0 -and [Math]::Abs($cpu - $lastCpu) -lt 0.05) { if (-not $idleSince) { $idleSince = Get-Date } } else { $idleSince = $null }
+        $lastCpu = $cpu
+        if ($idleSince -and ((Get-Date) - $idleSince).TotalSeconds -ge $IdleSec) {
+            $v = $false
+            $pr = [KillItWithFire.Prompt]::FindPrompt([int[]]@($running | ForEach-Object { [int]$_.ProcessId }), [ref]$v)
+            if ($pr -and (& $IsUnseen $v)) {
+                Stop-ProcessTreeSince $tree
+                return @{ Stopped = "stopped after $IdleSec s on a prompt nobody can answer: $pr"; Note = $null }
+            }
+        }
+        Start-Sleep -Seconds $PollSec
+    }
+}
+
 function Invoke-UninstallAttempt {
     # Level 1: the app's own uninstaller, once, silently (Get-UninstallCommand). A broken app is EXPECTED
     # to fail here; the scrub that follows does the rest either way.
@@ -3548,17 +3738,12 @@ function Invoke-UninstallAttempt {
         if ($c.Args) { $sp.ArgumentList = $c.Args }
         $p = Start-Process @sp
         $null = $p.Handle   # keep the handle, or ExitCode can come back empty once the process is gone
-        if (-not $p.WaitForExit(600000)) { try { $p.Kill() } catch { }; $res = 'failed: timed out after 10 minutes' }
+        $w = Wait-Uninstaller -Process $p -Target $t
+        if ($w.Stopped) { $res = "failed: $($w.Stopped)" }
         else {
             $code = $p.ExitCode
             $res = "exit $code$(switch ($code) { 0 { ' (uninstalled)' } 3010 { ' (uninstalled, reboot needed)' } 1605 { ' (not installed as far as Windows Installer knows)' } 1612 { ' (the installation source is gone: broken, as expected)' } default { '' } })"
-            # Some uninstallers hand off to a copy of themselves and exit early (Inno's second phase). Give a
-            # clean exit time to finish before the scrub starts, judged by the app's own uninstall entry going.
-            if (($code -eq 0 -or $code -eq 3010) -and (Test-UninstallEntryPresent $t)) {
-                $deadline = (Get-Date).AddSeconds(90)
-                while ((Get-Date) -lt $deadline -and (Test-UninstallEntryPresent $t)) { Start-Sleep -Seconds 2 }
-                if (Test-UninstallEntryPresent $t) { $res += '; its uninstall entry is still there after 90 s, so the scrub removes what is left' }
-            }
+            if ($w.Note) { $res += "; $($w.Note)" }
         }
     }
     $cmdText = $null
