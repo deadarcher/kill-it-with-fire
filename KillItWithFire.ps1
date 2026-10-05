@@ -3701,7 +3701,12 @@ function Invoke-PrimitiveOp {
             if (-not $k) { $rec.result = 'skipped'; break }
             Close-Key $k
             $expect = Get-Prop $Op 'expect'
-            if ($expect -and -not (Test-KeyExpectation $Op.hive $Op.path $expect)) { $rec.result = 'skipped'; $rec.note = 'no longer points at our class'; break }
+            if ($expect -and -not (Test-KeyExpectation $Op.hive $Op.path $expect)) {
+                # Say what it points at instead: "no longer ours" alone could not be diagnosed (Adobe's
+                # AcroExch.PDDoc, lab re-test 2026-10-05).
+                $ck = Open-Key $Op.hive "$($Op.path)\$($expect.sub)"; $nowAt = [string](Get-ValueSafe $ck ''); Close-Key $ck
+                $rec.result = 'skipped'; $rec.note = "no longer points at our class$(if ($nowAt) { " (its $($expect.sub) is $nowAt)" })"; break
+            }
             if ($script:Run.Backup) { $f = Join-Path $bk "$tag.reg"; Export-RegKeyBackup $Op.hive $Op.path $f; $rec.backup = $f }
             $parentPath, $leaf = Split-RegPath ([string]$Op.path)
             $parent = Open-Key $Op.hive $parentPath -Writable
