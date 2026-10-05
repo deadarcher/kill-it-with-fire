@@ -4771,11 +4771,15 @@ function Invoke-KillItWithFireResume {
 # child process with the switches it shows, so the window can do nothing the command line can't.
 # =====================================================================================================
 
-$script:LevelDescriptions = @(
-    'Scan only: lists what would be removed and why. Changes nothing.',
-    "Uninstall: runs the app's own uninstaller once, silently. For a broken app this usually fails; that is expected.",
-    'Registration cleanup: the uninstaller, then removes the uninstall entry and the Windows Installer registration so the app can install again. Files stay.',
-    'Full scrub: everything above, then unhooks the app from Windows and moves its files to a quarantine on the same drive. May need a reboot.'
+# Step 3's choices, by Tag: 0 = none yet (no scan), 1-3 = the levels, 4 = KILL IT WITH FIRE (level 3 without
+# the app's own uninstaller, the same as -KillIt).
+$script:ActionNames = @('', 'Uninstall', 'Registration cleanup', 'Full scrub', 'KILL IT WITH FIRE')
+$script:ActionDescriptions = @(
+    'Scan the app first (step 2). Then choose here how far to go.',
+    "Uninstall: runs the app's own uninstaller once, silently, and stops there. For a broken app this usually fails; that is expected.",
+    'Registration cleanup: the uninstaller, then the uninstall entry and the Windows Installer registration go, so the app can install again. Files stay.',
+    'Full scrub: the uninstaller, then everything it left behind: unhooks the app from Windows and moves its files to a quarantine on the same drive. May need a reboot.',
+    'KILL IT WITH FIRE: no uninstaller at all, straight to the full scrub. For an uninstaller that is broken, hangs or wants a click nobody is there to give. Still backed up, so Restore can undo it.'
 )
 $script:GroupDescriptions = @{
     Registration = 'The uninstall entry and the Windows Installer registration (product, features, upgrade code, component clients, patches, cached package). Removing them lets the app install again. Files are not touched.'
@@ -4814,9 +4818,10 @@ function Get-GuiGroups {
 }
 
 $script:WindowIcon = $null   # set once, by the first window (strict mode: read before it is set throws)
-function New-FlameIcon {
-    # The window's icon: a flame drawn here at run time, so there is no image file to ship and nothing is
-    # fetched from anywhere (2026-10-04).
+$script:FlameImage = $null   # the same flame, small, on KILL IT WITH FIRE and its button
+function New-FlameBitmap {
+    # A flame drawn here at run time, so there is no image file to ship and nothing is fetched from anywhere
+    # (2026-10-04). Drawn rather than the fire emoji: the window's text is GDI, which has no colour emoji.
     param([int] $Size = 32)
     Add-Type -AssemblyName System.Drawing
     $bmp = New-Object System.Drawing.Bitmap($Size, $Size)
@@ -4834,7 +4839,49 @@ function New-FlameIcon {
         $g.FillClosedCurve($yellow, $inner, [System.Drawing.Drawing2D.FillMode]::Winding, [single]0.4)
         $red.Dispose(); $yellow.Dispose()
     } finally { $g.Dispose() }
-    return [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+    return $bmp
+}
+
+function New-FlameIcon {
+    # The window's icon.
+    param([int] $Size = 32)
+    return [System.Drawing.Icon]::FromHandle((New-FlameBitmap $Size).GetHicon())
+}
+
+function Set-CueBanner {
+    # Grey hint text inside an empty box. The search box needed it: on its own it did not read as a search
+    # (2026-10-05). EM_SETCUEBANNER on both PowerShells: 5.1's WinForms has no PlaceholderText, and 7's hides
+    # it while the box has the focus, which the search box has from the start (wParam 1 = shown even then).
+    # Sent again whenever the box gets a new window handle; the text rides in Tag for that.
+    param($TextBox, [string] $Text)
+    if (-not ('KillItWithFire.Cue' -as [type])) {
+        Add-Type -Namespace KillItWithFire -Name Cue -MemberDefinition @'
+[DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessageW")]
+private static extern IntPtr SendText(IntPtr hWnd, int msg, IntPtr wParam, string lParam);
+[DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessageW")]
+private static extern IntPtr SendBuffer(IntPtr hWnd, int msg, System.Text.StringBuilder wParam, IntPtr lParam);
+public static void SetCue(IntPtr hWnd, string text) { SendText(hWnd, 0x1501, (IntPtr)1, text); }
+public static string GetCue(IntPtr hWnd) { var sb = new System.Text.StringBuilder(512); SendBuffer(hWnd, 0x1502, sb, (IntPtr)512); return sb.ToString(); }
+'@
+    }
+    $TextBox.Tag = $Text
+    $TextBox.Add_HandleCreated({ param($s, $e) [KillItWithFire.Cue]::SetCue($s.Handle, [string]$s.Tag) })
+    if ($TextBox.IsHandleCreated) { [KillItWithFire.Cue]::SetCue($TextBox.Handle, $Text) }
+}
+
+function Format-SelectedApp {
+    # What the window's Selected box says: the one app every step after the first acts on (2026-10-05).
+    # From the uninstall entry picked in the list, or from a plan's target when there is no entry.
+    param($Entry, $Target)
+    if ($Entry) {
+        $name = [string](Get-Prop $Entry 'DisplayName'); $ver = [string](Get-Prop $Entry 'DisplayVersion'); $pub = [string](Get-Prop $Entry 'Publisher')
+        $isMsi = [bool](Get-Prop $Entry 'IsMsi'); $scope = Get-EntryScopeLabel $Entry
+    } elseif ($Target) {
+        $name = [string](Get-Prop $Target 'displayName'); $ver = [string](Get-Prop $Target 'version'); $pub = [string](Get-Prop $Target 'publisher')
+        $isMsi = [bool](Get-Prop $Target 'isMsi'); $scope = $null
+    } else { return '' }
+    $about = @(@($pub, $(if ($isMsi) { 'MSI' } else { 'EXE' }), $scope) | Where-Object { $_ })
+    return ('{0}{1}   ({2})' -f $name, $(if ($ver) { " $ver" } else { '' }), ($about -join ', '))
 }
 
 function New-KillItWithFireForm {
@@ -4859,6 +4906,7 @@ function New-KillItWithFireForm {
     $f = New-Object System.Windows.Forms.Form
     $f.Text = 'Kill It With Fire - remove an app completely'
     if (-not $script:WindowIcon) { try { $script:WindowIcon = New-FlameIcon } catch { } }
+    if (-not $script:FlameImage) { try { $script:FlameImage = New-FlameBitmap 18 } catch { } }
     if ($script:WindowIcon) { $f.Icon = $script:WindowIcon }
     # Fits a 1024x768 screen: the buttons live in a bar docked at the bottom and the rest scrolls, so
     # Clean up / Restore / Close are never off-screen (they were, on the lab VM).
@@ -4876,80 +4924,101 @@ function New-KillItWithFireForm {
     $tip = New-Object System.Windows.Forms.ToolTip
     $ui.Form = $f; $ui.Tip = $tip
 
-    # 1. The app
+    # The steps run top to bottom in the order they happen: pick, scan, then what to clean. "How far" used to
+    # come before the scan, as if anything could happen without one, and KILL IT sat at the bottom of Options
+    # where nobody found it (Brian, 2026-10-05: "we need to SCAN first before we do anything else").
+
+    # 1. Pick the app. The box above the list says it is a search (it did not read as one).
     $lblApp = New-Object System.Windows.Forms.Label; $lblApp.Text = '1. Pick the app'; $lblApp.Location = '12,10'; $lblApp.AutoSize = $true; $lblApp.Font = $bold
-    $search = New-Object System.Windows.Forms.TextBox; $search.Location = '12,32'; $search.Size = '620,24'; $search.Anchor = 'Top,Left,Right'
-    $tip.SetToolTip($search, 'Type to filter the list')
-    $btnScan = New-Object System.Windows.Forms.Button; $btnScan.Text = '&Scan'; $btnScan.Location = '640,30'; $btnScan.Size = '92,27'; $btnScan.Anchor = 'Top,Right'
-    $tip.SetToolTip($btnScan, 'Build the plan for the selected app. Scanning changes nothing.')
-    $apps = New-Object System.Windows.Forms.ListView; $apps.Location = '12,62'; $apps.Size = '820,150'; $apps.View = 'Details'; $apps.FullRowSelect = $true; $apps.HideSelection = $false; $apps.MultiSelect = $false; $apps.Anchor = 'Top,Left,Right'
+    $lblSearch = New-Object System.Windows.Forms.Label; $lblSearch.Text = 'Searc&h:'; $lblSearch.Location = '12,37'; $lblSearch.AutoSize = $true
+    $search = New-Object System.Windows.Forms.TextBox; $search.Location = '66,33'; $search.Size = '766,24'; $search.Anchor = 'Top,Left,Right'
+    Set-CueBanner $search "Type part of an app's name or publisher to filter the list"
+    $apps = New-Object System.Windows.Forms.ListView; $apps.Location = '12,64'; $apps.Size = '820,150'; $apps.View = 'Details'; $apps.FullRowSelect = $true; $apps.HideSelection = $false; $apps.MultiSelect = $false; $apps.Anchor = 'Top,Left,Right'
     $apps.ShowItemToolTips = $true
     # Click a header to sort by it, again to reverse (Show-KillItWithFireGui). Installed and Size added 2026-10-04.
     foreach ($c in @(@('Name', 250, 'Left'), @('Version', 95, 'Left'), @('Publisher', 160, 'Left'), @('Type', 45, 'Left'), @('Scope', 110, 'Left'), @('Installed', 78, 'Left'), @('Size', 62, 'Right'))) {
         [void]$apps.Columns.Add([string]$c[0], [int]$c[1], [System.Windows.Forms.HorizontalAlignment]$c[2])
     }
     $ui.AppColumns = @('Name', 'Version', 'Publisher', 'Type', 'Scope', 'Installed', 'Size'); $ui.SortColumn = 0; $ui.SortDesc = $false
-    $ui.Search = $search; $ui.Apps = $apps; $ui.Scan = $btnScan
+    $ui.Search = $search; $ui.Apps = $apps
 
-    # 2. How far
-    $grpLevel = New-Object System.Windows.Forms.GroupBox; $grpLevel.Text = '2. How far'; $grpLevel.Location = '12,220'; $grpLevel.Size = '820,88'; $grpLevel.Anchor = 'Top,Left,Right'
-    $levels = @()
-    $labels = @('Scan &only', '&Uninstall', 'Re&gistration cleanup', '&Full scrub')
-    for ($i = 0; $i -le 3; $i++) {
-        $rb = New-Object System.Windows.Forms.RadioButton; $rb.Text = $labels[$i]; $rb.Location = New-Object System.Drawing.Point((14 + $i * 196), 20); $rb.AutoSize = $true; $rb.Tag = $i
-        $tip.SetToolTip($rb, $script:LevelDescriptions[$i])
-        $grpLevel.Controls.Add($rb); $levels += $rb
+    # 2. Scan it: the picked app in a box of its own, Scan beside it. Nothing after this step is offered until
+    # the app is scanned.
+    $grpScan = New-Object System.Windows.Forms.GroupBox; $grpScan.Text = '2. Scan it'; $grpScan.Location = '12,222'; $grpScan.Size = '820,80'; $grpScan.Anchor = 'Top,Left,Right'
+    $lblSel = New-Object System.Windows.Forms.Label; $lblSel.Text = 'Selected:'; $lblSel.Location = '12,26'; $lblSel.AutoSize = $true
+    # (BackColor set: a read-only box ignores ForeColor without it, and the grey hint below needs ForeColor.)
+    $txtSel = New-Object System.Windows.Forms.TextBox; $txtSel.Location = '78,22'; $txtSel.Size = '622,24'; $txtSel.ReadOnly = $true; $txtSel.TabStop = $false; $txtSel.Anchor = 'Top,Left,Right'
+    $txtSel.BackColor = [System.Drawing.SystemColors]::Control
+    $btnScan = New-Object System.Windows.Forms.Button; $btnScan.Text = '&Scan'; $btnScan.Location = '708,20'; $btnScan.Size = '100,28'; $btnScan.Anchor = 'Top,Right'; $btnScan.Font = $bold; $btnScan.Enabled = $false
+    $tip.SetToolTip($btnScan, 'Build the plan for the selected app: what would go, and why. Scanning changes nothing. (Enter in the search box or the list does the same.)')
+    $lblScan = New-Object System.Windows.Forms.Label; $lblScan.Location = '78,52'; $lblScan.Size = '730,20'; $lblScan.Anchor = 'Top,Left,Right'; $lblScan.AutoEllipsis = $true
+    $lblScan.ForeColor = [System.Drawing.SystemColors]::GrayText
+    $lblScan.Text = 'Scanning changes nothing: it lists what would go, and why.'
+    foreach ($c in @($lblSel, $txtSel, $btnScan, $lblScan)) { $grpScan.Controls.Add($c) }
+    $ui.Selected = $txtSel; $ui.Scan = $btnScan; $ui.ScanText = $lblScan; $ui.BoldFont = $bold
+    $ui.ShowSelected = {
+        # The picked app in bold; before there is one, a grey hint as text (a read-only box draws no cue banner).
+        param([string] $Text)
+        if ($Text) { $ui.Selected.Font = $ui.BoldFont; $ui.Selected.ForeColor = [System.Drawing.SystemColors]::ControlText; $ui.Selected.Text = $Text }
+        else { $ui.Selected.Font = $ui.Form.Font; $ui.Selected.ForeColor = [System.Drawing.SystemColors]::GrayText; $ui.Selected.Text = 'Nothing yet: click an app in the list above' }
     }
-    $levels[0].Checked = $true
-    $lblLevel = New-Object System.Windows.Forms.Label; $lblLevel.Location = '14,46'; $lblLevel.Size = '796,36'; $lblLevel.Anchor = 'Top,Left,Right'; $lblLevel.ForeColor = [System.Drawing.SystemColors]::GrayText
-    $lblLevel.Text = $script:LevelDescriptions[0]
-    $grpLevel.Controls.Add($lblLevel)
-    $ui.Levels = $levels; $ui.LevelGroup = $grpLevel; $ui.LevelText = $lblLevel
+    & $ui.ShowSelected ''
 
-    # 3. What to clean (the Disk Cleanup part: a checklist with sizes, a description, View items)
-    $grpCats = New-Object System.Windows.Forms.GroupBox; $grpCats.Text = '3. What to clean'; $grpCats.Location = '12,314'; $grpCats.Size = '820,226'; $grpCats.Anchor = 'Top,Left,Right'
-    $cats = New-Object System.Windows.Forms.CheckedListBox; $cats.Location = '10,20'; $cats.Size = '680,130'; $cats.CheckOnClick = $true; $cats.Anchor = 'Top,Left,Right'; $cats.IntegralHeight = $false
-    $btnView = New-Object System.Windows.Forms.Button; $btnView.Text = '&View items...'; $btnView.Location = '698,20'; $btnView.Size = '112,27'; $btnView.Anchor = 'Top,Right'; $btnView.Enabled = $false
-    $lblDescHead = New-Object System.Windows.Forms.Label; $lblDescHead.Text = 'Description'; $lblDescHead.Location = '10,156'; $lblDescHead.AutoSize = $true; $lblDescHead.Font = $bold
-    $lblDesc = New-Object System.Windows.Forms.Label; $lblDesc.Location = '10,176'; $lblDesc.Size = '800,44'; $lblDesc.Anchor = 'Top,Left,Right'
-    $lblDesc.Text = 'Scan an app, then choose Registration cleanup or Full scrub to pick what goes.'
-    foreach ($c in @($cats, $btnView, $lblDescHead, $lblDesc)) { $grpCats.Controls.Add($c) }
-    $ui.Categories = $cats; $ui.View = $btnView; $ui.Description = $lblDesc
+    # 3. What to clean: how far to go (after a scan only), then the Disk Cleanup part: a checklist with sizes,
+    # a description, View items. KILL IT WITH FIRE is one of the choices, not a checkbox down in Options.
+    $grpCats = New-Object System.Windows.Forms.GroupBox; $grpCats.Text = '3. What to clean'; $grpCats.Location = '12,310'; $grpCats.Size = '820,268'; $grpCats.Anchor = 'Top,Left,Right'
+    # A flow row, so a larger font or DPI pushes the choices along instead of drawing them over each other.
+    $flow = New-Object System.Windows.Forms.FlowLayoutPanel; $flow.Location = '8,18'; $flow.Size = '804,30'; $flow.Anchor = 'Top,Left,Right'; $flow.WrapContents = $false
+    $actions = @()
+    $labels = @('&Uninstall', 'Re&gistration cleanup', '&Full scrub', 'KILL IT &WITH FIRE')
+    for ($i = 1; $i -le 4; $i++) {
+        $rb = New-Object System.Windows.Forms.RadioButton; $rb.Text = $labels[$i - 1]; $rb.AutoSize = $true; $rb.Tag = $i; $rb.Enabled = $false
+        $rb.Margin = New-Object System.Windows.Forms.Padding(4, 3, 30, 0)
+        $tip.SetToolTip($rb, $script:ActionDescriptions[$i])
+        $flow.Controls.Add($rb); $actions += $rb
+    }
+    $kill = $actions[3]
+    $kill.Font = $bold; $kill.ForeColor = [System.Drawing.Color]::DarkRed
+    if ($script:FlameImage) { $kill.Image = $script:FlameImage; $kill.ImageAlign = 'MiddleLeft'; $kill.TextImageRelation = 'ImageBeforeText' }
+    $lblAction = New-Object System.Windows.Forms.Label; $lblAction.Location = '14,50'; $lblAction.Size = '796,34'; $lblAction.Anchor = 'Top,Left,Right'; $lblAction.ForeColor = [System.Drawing.SystemColors]::GrayText
+    $cats = New-Object System.Windows.Forms.CheckedListBox; $cats.Location = '10,88'; $cats.Size = '680,110'; $cats.CheckOnClick = $true; $cats.Anchor = 'Top,Left,Right'; $cats.IntegralHeight = $false
+    $btnView = New-Object System.Windows.Forms.Button; $btnView.Text = '&View items...'; $btnView.Location = '698,88'; $btnView.Size = '112,27'; $btnView.Anchor = 'Top,Right'; $btnView.Enabled = $false
+    $lblDescHead = New-Object System.Windows.Forms.Label; $lblDescHead.Text = 'Description'; $lblDescHead.Location = '10,204'; $lblDescHead.AutoSize = $true; $lblDescHead.Font = $bold
+    $lblDesc = New-Object System.Windows.Forms.Label; $lblDesc.Location = '10,224'; $lblDesc.Size = '800,38'; $lblDesc.Anchor = 'Top,Left,Right'
+    foreach ($c in @($flow, $lblAction, $cats, $btnView, $lblDescHead, $lblDesc)) { $grpCats.Controls.Add($c) }
+    $ui.Actions = $actions; $ui.KillIt = $kill; $ui.ActionText = $lblAction; $ui.Categories = $cats; $ui.View = $btnView; $ui.Description = $lblDesc
 
     # 4. Options
-    $grpOpt = New-Object System.Windows.Forms.GroupBox; $grpOpt.Text = '4. Options'; $grpOpt.Location = '12,546'; $grpOpt.Size = '820,122'; $grpOpt.Anchor = 'Top,Left,Right'
+    $grpOpt = New-Object System.Windows.Forms.GroupBox; $grpOpt.Text = '4. Options'; $grpOpt.Location = '12,586'; $grpOpt.Size = '820,100'; $grpOpt.Anchor = 'Top,Left,Right'
     $chkBackup = New-Object System.Windows.Forms.CheckBox; $chkBackup.Text = 'Keep a &backup (Restore can undo the run)'; $chkBackup.Location = '12,22'; $chkBackup.AutoSize = $true; $chkBackup.Checked = $true
     $chkLog = New-Object System.Windows.Forms.CheckBox; $chkLog.Text = 'Write a &log:'; $chkLog.Location = '330,22'; $chkLog.AutoSize = $true; $chkLog.Checked = $true
     $txtLog = New-Object System.Windows.Forms.TextBox; $txtLog.Location = '430,20'; $txtLog.Size = '378,24'; $txtLog.Anchor = 'Top,Left,Right'
     $tip.SetToolTip($txtLog, 'A file or a folder. Empty = log.txt in the run folder.')
-    $chkUser = New-Object System.Windows.Forms.CheckBox; $chkUser.Text = 'Include user &data (AppData)'; $chkUser.Location = '12,52'; $chkUser.AutoSize = $true
+    $chkUser = New-Object System.Windows.Forms.CheckBox; $chkUser.Text = 'Include user &data (AppData)'; $chkUser.Location = '12,50'; $chkUser.AutoSize = $true
     # "Include items that need review" read as "important, look at these", so as something to tick (first
     # outside try of the window, 2026-10-04). These are the WEAK matches, off on purpose: the tooltip says why.
-    $chkReview = New-Object System.Windows.Forms.CheckBox; $chkReview.Text = 'Also remove uncer&tain matches'; $chkReview.Location = '330,52'; $chkReview.AutoSize = $true
+    $chkReview = New-Object System.Windows.Forms.CheckBox; $chkReview.Text = 'Also remove uncer&tain matches'; $chkReview.Location = '330,50'; $chkReview.AutoSize = $true
     $tip.SetToolTip($chkReview, "Items tied to the app only by a name, its vendor or signer, or one MSI's claim on a Windows file. They may belong to another app or to Windows, so they stay unless you tick this. View items... lists each one and why it is uncertain.")
-    # KILL IT (2026-10-03): the hard way as its own, unmissable choice. Off (the default) is the proper way:
-    # the app's own uninstaller runs first. On is -KillIt: no uninstaller, the level jumps to Full scrub, and
-    # the Clean up button says "Kill it" so nobody does it by accident.
-    $chkUninst = New-Object System.Windows.Forms.CheckBox; $chkUninst.Text = "&KILL IT: skip the app's own uninstaller and scrub it out"; $chkUninst.Location = '12,78'; $chkUninst.AutoSize = $true; $chkUninst.Checked = $false
-    $chkUninst.Font = $bold; $chkUninst.ForeColor = [System.Drawing.Color]::DarkRed
-    $tip.SetToolTip($chkUninst, "Off = the proper way: the app's own uninstaller runs first, then the cleanup. On = -KillIt: no uninstaller, straight to the full scrub. It still backs everything up, so Restore can undo it.")
-    $lblPolicy = New-Object System.Windows.Forms.Label; $lblPolicy.Location = '12,100'; $lblPolicy.Size = '796,18'; $lblPolicy.ForeColor = [System.Drawing.Color]::DarkRed; $lblPolicy.Anchor = 'Top,Left,Right'
-    foreach ($c in @($chkBackup, $chkLog, $txtLog, $chkUser, $chkReview, $chkUninst, $lblPolicy)) { $grpOpt.Controls.Add($c) }
-    $ui.Backup = $chkBackup; $ui.LogCheck = $chkLog; $ui.LogPath = $txtLog; $ui.UserData = $chkUser; $ui.Review = $chkReview; $ui.KillIt = $chkUninst; $ui.PolicyLabel = $lblPolicy
+    $lblPolicy = New-Object System.Windows.Forms.Label; $lblPolicy.Location = '12,76'; $lblPolicy.Size = '796,18'; $lblPolicy.ForeColor = [System.Drawing.Color]::DarkRed; $lblPolicy.Anchor = 'Top,Left,Right'
+    foreach ($c in @($chkBackup, $chkLog, $txtLog, $chkUser, $chkReview, $lblPolicy)) { $grpOpt.Controls.Add($c) }
+    $ui.Backup = $chkBackup; $ui.LogCheck = $chkLog; $ui.LogPath = $txtLog; $ui.UserData = $chkUser; $ui.Review = $chkReview; $ui.PolicyLabel = $lblPolicy
 
     # The same run as a command line
-    $lblCmd = New-Object System.Windows.Forms.Label; $lblCmd.Text = 'The same run from a command line (RMM, PDQ, Intune):'; $lblCmd.Location = '12,676'; $lblCmd.AutoSize = $true
-    $txtCmd = New-Object System.Windows.Forms.TextBox; $txtCmd.Location = '12,696'; $txtCmd.Size = '728,24'; $txtCmd.ReadOnly = $true; $txtCmd.Anchor = 'Top,Left,Right'
-    $btnCopy = New-Object System.Windows.Forms.Button; $btnCopy.Text = 'Cop&y'; $btnCopy.Location = '746,694'; $btnCopy.Size = '86,27'; $btnCopy.Anchor = 'Top,Right'
+    $lblCmd = New-Object System.Windows.Forms.Label; $lblCmd.Text = 'The same run from a command line (RMM, PDQ, Intune):'; $lblCmd.Location = '12,694'; $lblCmd.AutoSize = $true
+    $txtCmd = New-Object System.Windows.Forms.TextBox; $txtCmd.Location = '12,714'; $txtCmd.Size = '728,24'; $txtCmd.ReadOnly = $true; $txtCmd.Anchor = 'Top,Left,Right'
+    $btnCopy = New-Object System.Windows.Forms.Button; $btnCopy.Text = 'Cop&y'; $btnCopy.Location = '746,712'; $btnCopy.Size = '86,27'; $btnCopy.Anchor = 'Top,Right'
     $ui.Command = $txtCmd; $ui.Copy = $btnCopy
 
     $status = New-Object System.Windows.Forms.Label; $status.Location = '12,14'; $status.Size = '496,20'; $status.Anchor = 'Top,Left,Right'; $status.Text = 'Pick an app and press Scan. Scanning changes nothing.'
+    # KILL IT WITH FIRE relabels this "Kill it" and puts the flame on it, so nobody does it by accident.
     $btnClean = New-Object System.Windows.Forms.Button; $btnClean.Text = '&Clean up'; $btnClean.Location = '520,8'; $btnClean.Size = '100,30'; $btnClean.Anchor = 'Top,Right'; $btnClean.Enabled = $false
+    $btnClean.ImageAlign = 'MiddleLeft'; $btnClean.TextImageRelation = 'ImageBeforeText'
     $btnRestore = New-Object System.Windows.Forms.Button; $btnRestore.Text = '&Restore...'; $btnRestore.Location = '626,8'; $btnRestore.Size = '100,30'; $btnRestore.Anchor = 'Top,Right'
     $tip.SetToolTip($btnRestore, 'Put back everything an earlier run changed')
     $btnClose = New-Object System.Windows.Forms.Button; $btnClose.Text = 'Close'; $btnClose.Location = '732,8'; $btnClose.Size = '100,30'; $btnClose.Anchor = 'Top,Right'
     $ui.Clean = $btnClean; $ui.Restore = $btnRestore; $ui.Close = $btnClose; $ui.Status = $status
-    foreach ($c in @($lblApp, $search, $btnScan, $apps, $grpLevel, $grpCats, $grpOpt, $lblCmd, $txtCmd, $btnCopy)) { $main.Controls.Add($c) }
+    # In this order: it is the Tab order too, and the Search label's Alt+H lands in the box after it.
+    foreach ($c in @($lblApp, $lblSearch, $search, $apps, $grpScan, $grpCats, $grpOpt, $lblCmd, $txtCmd, $btnCopy)) { $main.Controls.Add($c) }
     foreach ($c in @($status, $btnClean, $btnRestore, $btnClose)) { $bar.Controls.Add($c) }
     $ui.Main = $main
     $f.CancelButton = $btnClose
@@ -4959,13 +5028,13 @@ function New-KillItWithFireForm {
 
     # Administrator locks: greyed out and labelled. The engine enforces them whatever the window shows.
     $locks = @()
+    # A choice past MaxLevel is never offered, KILL IT WITH FIRE included (it is a full scrub). Rebuild keeps
+    # them greyed after a scan too; the engine would refuse the run anyway, but the window must not offer
+    # what the administrator took away.
+    $ui.ActionAllowed = { param([int] $Tag) ($null -eq $ui.Policy.MaxLevel) -or ([Math]::Min(3, $Tag) -le [int]$ui.Policy.MaxLevel) }
     if ($null -ne $Policy.MaxLevel) {
-        for ($i = 0; $i -le 3; $i++) { if ($i -gt [int]$Policy.MaxLevel) { $levels[$i].Enabled = $false; $tip.SetToolTip($levels[$i], 'Set by your administrator') } }
+        foreach ($rb in $actions) { if (-not (& $ui.ActionAllowed ([int]$rb.Tag))) { $tip.SetToolTip($rb, $(if ([int]$rb.Tag -eq 4) { 'Set by your administrator (KILL IT WITH FIRE is a full scrub)' } else { 'Set by your administrator' })) } }
         $locks += "highest level $($Policy.MaxLevel)"
-        # KILL IT selects Full scrub, and .Checked on a DISABLED radio still works from code: without this
-        # the box would walk straight past the lock (the engine would still refuse the run, but the window
-        # must not offer what the administrator took away).
-        if ([int]$Policy.MaxLevel -lt 3) { $chkUninst.Enabled = $false; $tip.SetToolTip($chkUninst, 'Set by your administrator (KILL IT is a full scrub)') }
     }
     if ($Policy.RequireBackup) { $chkBackup.Checked = $true; $chkBackup.Enabled = $false; $tip.SetToolTip($chkBackup, 'Set by your administrator'); $locks += 'backup required' }
     if ($Policy.RequireLog) { $chkLog.Checked = $true; $chkLog.Enabled = $false; $tip.SetToolTip($chkLog, 'Set by your administrator'); $locks += 'log required' }
@@ -4975,25 +5044,34 @@ function New-KillItWithFireForm {
     $lblPolicy.Text = if ($locks.Count) { 'Set by your administrator: ' + ($locks -join ', ') } else { '' }
     $ui.Locks = $locks
 
-    $ui.GetLevel = { [int](($ui.Levels | Where-Object { $_.Checked } | Select-Object -First 1).Tag) }
+    # Step 3's choice by Tag (0 = none yet), and the level it runs at: KILL IT WITH FIRE is level 3 that skips
+    # the app's own uninstaller.
+    $ui.GetAction = { $on = @($ui.Actions | Where-Object { $_.Checked }); if ($on.Count) { [int]$on[0].Tag } else { 0 } }
+    $ui.GetLevel = { [Math]::Min(3, [int](& $ui.GetAction)) }
     $ui.UpdateCommand = {
         $lvl = & $ui.GetLevel
+        $kill = [bool]$ui.KillIt.Checked
         $present = @(Get-GuiGroups $ui.Plan $lvl | ForEach-Object { $_.Group })
         $exclude = @($present | Where-Object { $ui.Unchecked.ContainsKey($_) })
         $appName = if ($ui.App) { $ui.App.DisplayName } elseif ($ui.Plan) { $ui.Plan.target.displayName } else { '<app>' }
         $pcode = if ($ui.App -and $ui.App.ProductCode -and $ui.App.IsMsi) { $ui.App.ProductCode } elseif (-not $ui.App -and $ui.Plan -and $ui.Plan.target.productCode -and (Get-Prop $ui.Plan.target 'isMsi')) { $ui.Plan.target.productCode } else { $null }
         $ui.Command.Text = Format-CommandLine -AppName $appName -ProductCode $pcode -Level $lvl -Exclude $exclude -IncludeUserData $ui.UserData.Checked -IncludeReview $ui.Review.Checked `
-            -NoBackup (-not $ui.Backup.Checked) -NoLog (-not $ui.LogCheck.Checked) -LogPath $ui.LogPath.Text -SkipUninstall $ui.KillIt.Checked
-        $ui.Clean.Text = $(if ($ui.KillIt.Checked) { '&Kill it' } else { '&Clean up' })
+            -NoBackup (-not $ui.Backup.Checked) -NoLog (-not $ui.LogCheck.Checked) -LogPath $ui.LogPath.Text -SkipUninstall $kill
+        $ui.Clean.Text = $(if ($kill) { '&Kill it' } else { '&Clean up' })
+        $ui.Clean.Image = $(if ($kill) { $script:FlameImage } else { $null })
         $ui.LogPath.Enabled = $ui.LogCheck.Checked -and -not $ui.Policy.LogPath
         # Never while a run is going: ticking any option mid-run used to switch Clean up back on, and a
         # second click started a second run of the same plan alongside the first (2026-10-05).
         $ui.Clean.Enabled = [bool]($ui.Plan -and $lvl -ge 1 -and -not $ui.Busy)
+        $ui.Scan.Enabled = [bool]($ui.App -and -not $ui.Busy)
     }
     $ui.Rebuild = {
-        # The checklist for the current plan and level; the user's unticks survive a level change.
-        $lvl = & $ui.GetLevel
-        $ui.LevelText.Text = $script:LevelDescriptions[$lvl]
+        # Step 3 for the current plan and choice; the user's unticks survive a change of choice. Nothing in it
+        # is offered before a scan, or for an app the scan refused.
+        $act = & $ui.GetAction; $lvl = & $ui.GetLevel
+        $scanned = [bool]($ui.Plan -and -not (Get-Prop $ui.Plan 'refused'))
+        foreach ($rb in $ui.Actions) { $rb.Enabled = ($scanned -and (& $ui.ActionAllowed ([int]$rb.Tag))) }
+        $ui.ActionText.Text = $script:ActionDescriptions[$(if ($scanned) { $act } else { 0 })]
         $ui.Loading = $true
         $ui.Categories.BeginUpdate(); $ui.Categories.Items.Clear()
         foreach ($row in @(Get-GuiGroups $ui.Plan $lvl)) {
@@ -5004,10 +5082,14 @@ function New-KillItWithFireForm {
         $ui.Loading = $false
         $ui.Categories.Enabled = ($lvl -ge 2 -and $ui.Categories.Items.Count -gt 0)
         $ui.View.Enabled = [bool]$ui.Plan
-        if (-not $ui.Plan) { $ui.Description.Text = 'Scan an app, then choose Registration cleanup or Full scrub to pick what goes.' }
-        elseif ($lvl -lt 2) { $ui.Description.Text = "Pick Registration cleanup or Full scrub to choose what goes. The scan found $(@($ui.Plan.items).Count) item(s)." }
-        elseif (-not $ui.Categories.Items.Count) { $ui.Description.Text = 'Nothing to clean at this level.' }
-        else { $ui.Description.Text = "Everything ticked goes when you press Clean up (it asks first). Untick a category to keep it, select one to see what it is, or View items for each item and the scan's notes." }
+        $found = if ($ui.Plan) { @($ui.Plan.items).Count } else { 0 }
+        $ui.Description.Text = if (-not $ui.Plan) { 'Once the app is scanned, this lists what would go, by kind, with sizes. Untick whatever should stay.' }
+        elseif (-not $scanned) { 'Nothing to clean: the scan refused this app (step 2 says why).' }
+        elseif ($act -eq 0 -and -not (& $ui.ActionAllowed 1)) { "Your administrator allows scans only here. View items lists the $found item(s) the scan found." }
+        elseif ($act -eq 0) { 'Choose how far to go, above.' }
+        elseif ($lvl -lt 2) { "Uninstall runs only the app's own uninstaller, so there is nothing here to tick. The scan found $found item(s): Registration cleanup, Full scrub and KILL IT WITH FIRE remove them." }
+        elseif (-not $ui.Categories.Items.Count) { 'Nothing to clean at this level.' }
+        else { "Everything ticked goes when you press $(if ($ui.KillIt.Checked) { 'Kill it' } else { 'Clean up' }) (it asks first). Untick a category to keep it, select one to see what it is, or View items for each item and the scan's notes." }
         # Strict mode: a property of $null throws, so no plan means no items, not $ui.Plan.items.
         $planItems = if ($ui.Plan) { @($ui.Plan.items) } else { @() }
         $ud = @($planItems | Where-Object { $_.group -eq 'UserData' -and $_.level -le $lvl })
@@ -5021,29 +5103,35 @@ function New-KillItWithFireForm {
         param($PlanObject)
         $ui.Plan = $PlanObject
         $ui.Unchecked = @{}
-        # A scan moves the level to the furthest the policy allows, so "3. What to clean" fills at once with what
-        # the scan found. Left at Scan only, the list stayed EMPTY after a scan and the window read as broken
-        # (first outside try, 2026-10-04). Nothing runs until Clean up, which asks first.
-        $max = if ($null -ne $ui.Policy.MaxLevel) { [Math]::Min(3, [int]$ui.Policy.MaxLevel) } else { 3 }
-        if ($max -ge 2 -and -not (Get-Prop $PlanObject 'refused')) { $ui.Levels[$max].Checked = $true }
+        # A scan opens step 3 on the furthest PROPER choice the policy allows (Full scrub: the app's own
+        # uninstaller still runs first), so What to clean fills at once with what the scan found. Left at nothing,
+        # the list stayed EMPTY after a scan and the window read as broken (first outside try, 2026-10-04).
+        # KILL IT WITH FIRE is never chosen for you. Nothing runs until Clean up, which asks first.
+        foreach ($rb in $ui.Actions) { $rb.Checked = $false }
+        $refused = [string](Get-Prop $PlanObject 'refused')
+        $best = @($ui.Actions | Where-Object { [int]$_.Tag -le 3 -and (& $ui.ActionAllowed ([int]$_.Tag)) } | Select-Object -Last 1)
+        if (-not $refused -and $best.Count) { $best[0].Checked = $true }
         & $ui.Rebuild
+        $found = @($PlanObject.items).Count
         $notes = @(Get-Prop $PlanObject 'warnings' | Where-Object { $_ }).Count
-        $ui.Status.Text = "Scanned '$($PlanObject.target.displayName)': $(@($PlanObject.items).Count) item(s)$(if ($notes) { ", $notes note(s)" }). Nothing changed yet."
+        & $ui.ShowSelected (Format-SelectedApp $ui.App $PlanObject.target)
+        $ui.Status.Text = "Scanned '$($PlanObject.target.displayName)': $found item(s)$(if ($notes) { ", $notes note(s)" }). Nothing changed yet."
+        $ui.ScanText.Text = if ($refused) { "Refused: $refused" } else { "Scanned: $found item(s)$(if ($notes) { ", $notes note(s) (View items)" }). Nothing changed yet. Now choose what to clean, below." }
+    }
+    $ui.ClearPlan = {
+        # A different app, or a run that changed the machine: the scan no longer describes it. Back to step 2.
+        $ui.Plan = $null; $ui.PlanFile = $null
+        foreach ($rb in $ui.Actions) { $rb.Checked = $false }
+        & $ui.Rebuild
     }
 
-    foreach ($rb in $levels) {
+    foreach ($rb in $actions) {
         $rb.Add_CheckedChanged({
                 if (-not $this.Checked) { return }
-                # Below registration cleanup there is nothing to kill: KILL IT only means something at 2 and 3.
-                if ([int]$this.Tag -lt 2 -and $ui.KillIt.Checked) { $ui.KillIt.Checked = $false }
                 & $ui.Rebuild
             })
     }
     foreach ($c in @($chkBackup, $chkLog, $chkUser, $chkReview)) { $c.Add_CheckedChanged({ & $ui.UpdateCommand }) }
-    $chkUninst.Add_CheckedChanged({
-            # KILL IT goes all the way: tick it and the level moves to Full scrub (the level handler rebuilds).
-            if ($ui.KillIt.Checked -and (& $ui.GetLevel) -lt 3) { $ui.Levels[3].Checked = $true } else { & $ui.UpdateCommand }
-        })
     $txtLog.Add_TextChanged({ & $ui.UpdateCommand })
     $cats.Add_ItemCheck({
             if ($ui.Loading) { return }
@@ -5163,11 +5251,21 @@ function Show-KillItWithFireGui {
             $picked = $ui.Apps.SelectedItems[0].Tag
             if (Test-SameEntry $picked $ui.App) { return }
             $ui.App = $picked
-            $ui.Plan = $null; $ui.PlanFile = $null
-            & $ui.Rebuild
+            & $ui.ShowSelected (Format-SelectedApp $picked)
+            & $ui.ClearPlan
+            $ui.ScanText.Text = 'Press Scan. It changes nothing: it lists what would go, and why.'
             $ui.Status.Text = "Selected '$($ui.App.DisplayName)'. Press Scan."
         })
     $ui.Apps.Add_DoubleClick({ $ui.Scan.PerformClick() })
+    # Enter scans the picked app, from the search box or the list: type a name, Enter (a single match is
+    # picked by itself).
+    $enterScans = {
+        param($s, $e)
+        if ($e.KeyCode -ne [System.Windows.Forms.Keys]::Enter) { return }
+        $e.SuppressKeyPress = $true   # no ding from the search box
+        if ($ui.Scan.Enabled) { $ui.Scan.PerformClick() }
+    }
+    $ui.Search.Add_KeyDown($enterScans); $ui.Apps.Add_KeyDown($enterScans)
     $ui.Close.Add_Click({ $ui.Form.Close() })
 
     $timer = New-Object System.Windows.Forms.Timer; $timer.Interval = 700
@@ -5175,7 +5273,7 @@ function Show-KillItWithFireGui {
     $finish = {
         $timer.Stop()
         $ui.Busy = $false
-        foreach ($b in @($ui.Scan, $ui.Restore)) { $b.Enabled = $true }
+        $ui.Restore.Enabled = $true   # (Scan and Clean up: UpdateCommand, below, from what is picked and loaded)
         $code = $state.Proc.ExitCode
         $output = $state.Lines.ToString()
         if ($state.Err -and $state.Err.IsCompleted -and $state.Err.Result) { $output += "`r`n" + $state.Err.Result }
@@ -5183,9 +5281,13 @@ function Show-KillItWithFireGui {
             $pf = Join-Path $state.Dir 'plan.json'
             # Only for the app it scanned. Another app picked mid-scan used to receive this plan, and the command
             # line then named the new app at the old one's level: copied into an RMM, it would hit the wrong app.
-            if (-not (Test-SameEntry $state.ScanApp $ui.App)) { $ui.Status.Text = "The scan of '$($state.ScanApp.DisplayName)' finished, but '$($ui.App.DisplayName)' is picked now. Press Scan."; & $ui.UpdateCommand }
+            if (-not (Test-SameEntry $state.ScanApp $ui.App)) {
+                $ui.Status.Text = "The scan of '$($state.ScanApp.DisplayName)' finished, but '$($ui.App.DisplayName)' is picked now. Press Scan."
+                $ui.ScanText.Text = 'Press Scan. It changes nothing: it lists what would go, and why.'
+                & $ui.UpdateCommand
+            }
             elseif ($code -eq 0 -and (Test-Path -LiteralPath $pf)) { $ui.PlanFile = $pf; & $ui.LoadPlan (Get-Content -LiteralPath $pf -Raw -Encoding UTF8 | ConvertFrom-Json) }
-            else { $ui.Status.Text = "Scan stopped (exit $code)."; & $ui.UpdateCommand; Show-TextDialog 'Kill It With Fire: scan' $output $ui.Form }
+            else { $ui.Status.Text = "Scan stopped (exit $code)."; $ui.ScanText.Text = "The scan stopped (exit $code). Press Scan to try again."; & $ui.UpdateCommand; Show-TextDialog 'Kill It With Fire: scan' $output $ui.Form }
         } else {
             # By kind: a restore's 3010 means "reboot and it's in effect" and its 1 means "not finished, run
             # Restore again"; only a cleanup's 3010 goes on to Resume (review 2026-09-29).
@@ -5198,7 +5300,8 @@ function Show-KillItWithFireGui {
             Show-TextDialog "Kill It With Fire: $($state.Kind) (exit $code, $meaning)" $output $ui.Form
             # After a restore too: it changed the machine, so a scan from before it no longer describes it.
             # (It also left Clean up greyed out with that plan still loaded until something else redrew it.)
-            $ui.Plan = $null; $ui.PlanFile = $null; & $ui.Rebuild
+            & $ui.ClearPlan
+            $ui.ScanText.Text = $(if ($ui.App) { 'Press Scan to see what is left now.' } else { 'Scanning changes nothing: it lists what would go, and why.' })
         }
     }
     $timer.Add_Tick({
@@ -5213,6 +5316,7 @@ function Show-KillItWithFireGui {
             }
             $secs = [int]((Get-Date) - $state.Started).TotalSeconds
             $ui.Status.Text = ("{0}: {1} s  {2}" -f $state.Kind, $secs, [string]$state.Last)
+            if ($state.Kind -eq 'Scan') { $ui.ScanText.Text = ("Scanning: {0} s  {1}" -f $secs, [string]$state.Last) }
             if ($state.Proc.HasExited -and -not $state.Read) { & $finish }
         })
     # Not while a run is going: closing would leave it working with nobody watching, its result unseen
@@ -5276,13 +5380,13 @@ function Show-KillItWithFireGui {
             $dlg.Controls.Add($lv); [void]$dlg.ShowDialog($ui.Form); $dlg.Dispose()
         })
     $ui.Clean.Add_Click({
-            $lvl = & $ui.GetLevel
+            $act = & $ui.GetAction; $lvl = & $ui.GetLevel
             $present = @(Get-GuiGroups $ui.Plan $lvl | ForEach-Object { $_.Group })
             $exclude = @($present | Where-Object { $ui.Unchecked.ContainsKey($_) })
             $keep = @($present | Where-Object { -not $ui.Unchecked.ContainsKey($_) })
-            $msg = "Level $lvl ($(@('scan only', 'uninstall', 'registration cleanup', 'full scrub')[$lvl])) on '$($ui.Plan.target.displayName)'.`n`n"
+            $msg = "$($script:ActionNames[$act]) (level $lvl) on '$($ui.Plan.target.displayName)'.`n`n"
             if ($lvl -ge 2) { $msg += "Categories: $(if ($keep.Count) { $keep -join ', ' } else { '(none)' })`n" }
-            $msg += "The app's own uninstaller: $(if ($ui.KillIt.Checked) { 'SKIPPED - KILL IT scrubs the app out without it' } else { 'runs first' })`n"
+            $msg += "The app's own uninstaller: $(if ($ui.KillIt.Checked) { 'SKIPPED - KILL IT WITH FIRE scrubs the app out without it' } else { 'runs first' })`n"
             $msg += "Backup: $(if ($ui.Backup.Checked) { 'yes, a restore can undo it' } else { 'NO - this run cannot be restored' })`n"
             # The scan's notes, at the last moment before a full scrub (a folder holding other programs, say).
             $notes = @(Get-Prop $ui.Plan 'warnings' | Where-Object { $_ })
@@ -5334,7 +5438,7 @@ function Show-KillItWithFireGui {
 function Invoke-GuiSelfTest {
     # Builds the window without showing it, renders it to a PNG and prints the control states as JSON:
     # how the tests prove the administrator locks, the checklist and the command line without a person
-    # at the screen. -Plan loads a plan; the highest level the policy allows is selected.
+    # at the screen. -Plan loads a plan, as a finished scan would; without one the window is as it opens.
     param($Policy, [string] $PngPath, [string] $PlanFile)
     $ui = New-KillItWithFireForm -Policy $Policy -PlanFile $PlanFile
     # Shown off-screen: a form that was never shown has no child windows, and DrawToBitmap then renders
@@ -5344,18 +5448,23 @@ function Invoke-GuiSelfTest {
     $ui.Form.ShowInTaskbar = $false
     $ui.Form.Show()
     [System.Windows.Forms.Application]::DoEvents()
-    $max = if ($null -ne $Policy.MaxLevel) { [Math]::Min(3, [int]$Policy.MaxLevel) } else { 3 }
-    $levelAfterScan = & $ui.GetLevel   # what loading a scan selected by itself, before this test touches it
-    if ($ui.Plan) { $ui.Levels[$max].Checked = $true }
+    $levelAfterScan = & $ui.GetLevel   # what loading a scan chose by itself; this test has touched nothing yet
     if ($ui.Categories.Items.Count) { $ui.Categories.SelectedIndex = 0 }
     [System.Windows.Forms.Application]::DoEvents()
-    $w = $ui.Form.Width; $h = $ui.Form.Height
-    $bmp = New-Object System.Drawing.Bitmap($w, $h)
-    $ui.Form.DrawToBitmap($bmp, (New-Object System.Drawing.Rectangle(0, 0, $w, $h)))
-    $bmp.Save($PngPath, [System.Drawing.Imaging.ImageFormat]::Png)
-    $bmp.Dispose()
+    $render = {
+        param([string] $Path)
+        $w = $ui.Form.Width; $h = $ui.Form.Height
+        $bmp = New-Object System.Drawing.Bitmap($w, $h)
+        $ui.Form.DrawToBitmap($bmp, (New-Object System.Drawing.Rectangle(0, 0, $w, $h)))
+        $bmp.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
+        $bmp.Dispose()
+    }
+    & $render $PngPath
     $stateOut = [ordered]@{
-        level = (& $ui.GetLevel); levelsEnabled = @($ui.Levels | ForEach-Object { $_.Enabled }); levelText = $ui.LevelText.Text
+        level = (& $ui.GetLevel); action = (& $ui.GetAction); actionsEnabled = @($ui.Actions | ForEach-Object { $_.Enabled }); actionText = $ui.ActionText.Text
+        actionLabels = @($ui.Actions | ForEach-Object { $_.Text }); killItHasImage = ($null -ne $ui.KillIt.Image)
+        selectedText = $ui.Selected.Text; selectedBold = $ui.Selected.Font.Bold; searchCue = [KillItWithFire.Cue]::GetCue($ui.Search.Handle)
+        scanText = $ui.ScanText.Text; scanEnabled = $ui.Scan.Enabled
         backupChecked = $ui.Backup.Checked; backupEnabled = $ui.Backup.Enabled
         logChecked = $ui.LogCheck.Checked; logEnabled = $ui.LogCheck.Enabled; logPath = $ui.LogPath.Text; logPathEnabled = $ui.LogPath.Enabled
         killItChecked = $ui.KillIt.Checked; cleanText = $ui.Clean.Text; userDataEnabled = $ui.UserData.Enabled; userDataText = $ui.UserData.Text; reviewText = $ui.Review.Text; policyLabel = $ui.PolicyLabel.Text
@@ -5372,17 +5481,18 @@ function Invoke-GuiSelfTest {
     $ui.Review.Checked = -not $ui.Review.Checked
     $ui.Busy = $false
     & $ui.UpdateCommand
-    # The KILL IT wiring: from Scan only, ticking it must jump to Full scrub, say -KillIt, and relabel the
-    # button; dropping back to level 1 must untick it (there is nothing to kill there).
+    # The KILL IT WITH FIRE wiring: choosing it runs Full scrub's level without the uninstaller, says -KillIt,
+    # and relabels the button (with the flame); choosing Uninstall after it must leave none of that behind.
     if ($ui.Plan -and $ui.KillIt.Enabled) {
-        $ui.Levels[0].Checked = $true
         $ui.KillIt.Checked = $true
         [System.Windows.Forms.Application]::DoEvents()
-        $k = [ordered]@{ level = (& $ui.GetLevel); command = $ui.Command.Text; cleanText = $ui.Clean.Text }
-        $ui.Levels[1].Checked = $true
+        $k = [ordered]@{ level = (& $ui.GetLevel); command = $ui.Command.Text; cleanText = $ui.Clean.Text; cleanHasImage = ($null -ne $ui.Clean.Image) }
+        & $render ($PngPath -replace '\.png$', '-killit.png')
+        $ui.Actions[0].Checked = $true
         [System.Windows.Forms.Application]::DoEvents()
         $k.checkedAfterLevel1 = $ui.KillIt.Checked
         $k.cleanTextAfterLevel1 = $ui.Clean.Text
+        $k.commandAfterLevel1 = $ui.Command.Text
         $stateOut.killIt = $k
     }
     $ui.Form.Close()

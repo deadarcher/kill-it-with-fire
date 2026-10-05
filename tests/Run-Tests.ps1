@@ -367,6 +367,9 @@ $lv.Dispose()
 Assert-Equal $true (Test-SameEntry $fx[1] ([pscustomobject]@{ KeyPath = 'k\alpha'; Hive = 'HKLM32' })) 'same entry: one key in one hive'
 Assert-Equal $false (Test-SameEntry $fx[1] ([pscustomobject]@{ KeyPath = 'k\alpha'; Hive = 'HKLM64' })) 'same entry: the same key name in the other view is another app'
 Assert-Equal $false (Test-SameEntry $fx[1] $null) 'same entry: nothing picked is never the scanned app'
+Assert-Equal 'alpha 10.2   (A, EXE, Machine 32-bit)' (Format-SelectedApp $fx[1]) 'selected box: name, version, publisher, type and scope'
+Assert-Equal 'Test App   (MSI)' (Format-SelectedApp $null ([pscustomobject]@{ displayName = 'Test App'; isMsi = $true })) 'selected box: from a plan target; what is missing leaves no gap'
+Assert-Equal '' (Format-SelectedApp $null $null) 'selected box: nothing picked'
 Assert-Equal 'dotPDN LLC' (Select-SignerOrg @{ 'Microsoft Corporation' = 3; 'dotPDN LLC' = 1 }) 'signer: a third-party app bundling Microsoft-signed runtime files is still its vendor''s (paint.net)'
 Assert-Equal 'Microsoft Corporation' (Select-SignerOrg @{ 'Microsoft Corporation' = 2 }) 'signer: all Microsoft-signed is Microsoft (the refusal still holds)'
 Assert-Equal $null (Select-SignerOrg @{}) 'signer: nothing signed, no signer'
@@ -553,19 +556,35 @@ try {
     '{}' | Set-Content -LiteralPath (Join-Path $guiDir 'open.json') -Encoding ASCII
     '{"MaxLevel":2,"RequireBackup":1,"RequireLog":1,"LogPath":"\\\\srv\\logs\\","AllowUserData":0}' | Set-Content -LiteralPath (Join-Path $guiDir 'locked.json') -Encoding ASCII
     $runGui = {
-        param([string] $Policy, [string] $Png)
+        param([string] $Policy, [string] $Png, [switch] $NoPlan)
         $ErrorActionPreference = 'Continue'
-        $out = & $hostExe -NoProfile -ExecutionPolicy Bypass -File $engine -GuiSelfTest $Png -Plan $planFile -PolicyFile (Join-Path $guiDir $Policy) 2>&1 | Out-String
+        $planArgs = if ($NoPlan) { @() } else { @('-Plan', $planFile) }
+        $out = & $hostExe -NoProfile -ExecutionPolicy Bypass -File $engine -GuiSelfTest $Png @planArgs -PolicyFile (Join-Path $guiDir $Policy) 2>&1 | Out-String
         $json = $out.Substring([Math]::Max(0, $out.IndexOf('{')))
         try { return ($json | ConvertFrom-Json) } catch { Write-Host "GUI self-test output was not JSON:`n$out"; return $null }
     }
     $engine = Join-Path $PSScriptRoot '..\KillItWithFire.ps1'
+    # As it opens: pick, then scan, and only then anything else (Brian, 2026-10-05: "we need to SCAN first").
+    $s = & $runGui 'open.json' (Join-Path $guiDir 'fresh.png') -NoPlan
+    Assert-Equal $true ($null -ne $s) 'window self-test ran (nothing scanned yet)'
+    if ($s) {
+        Assert-Equal 'False,False,False,False' (@($s.actionsEnabled) -join ',') 'before a scan, step 3 offers nothing'
+        Assert-Equal '0|0|False|False' "$($s.action)|$($s.level)|$($s.scanEnabled)|$($s.cleanEnabled)" 'nothing chosen, nothing to scan or clean until an app is picked'
+        Assert-Equal $true ($s.actionText -like 'Scan the app first*') 'step 3 says to scan first'
+        Assert-Equal 'Nothing yet: click an app in the list above|False' "$($s.selectedText)|$($s.selectedBold)" 'the Selected box says nothing is picked, in grey, not bold'
+        Assert-Equal "Type part of an app's name or publisher to filter the list" $s.searchCue 'the search box says it is a search (cue banner set on the real control)'
+        Assert-Equal '&Uninstall|Re&gistration cleanup|&Full scrub|KILL IT &WITH FIRE' (@($s.actionLabels) -join '|') 'step 3 choices, KILL IT WITH FIRE among them'
+        Assert-Equal $true ([bool]$s.killItHasImage) 'KILL IT WITH FIRE carries the flame'
+    }
     $s = & $runGui 'open.json' (Join-Path $guiDir 'open.png')
     Assert-Equal $true ($null -ne $s) 'window self-test ran (no policy)'
     if ($s) {
         Assert-Equal 3 $s.level 'no policy: the highest level is selectable and selected'
         Assert-Equal 3 $s.levelAfterScan 'a scan moves the window to Full scrub by itself, so What to clean fills (it stayed empty at Scan only)'
-        Assert-Equal 'True,True,True,True' (@($s.levelsEnabled) -join ',') 'no policy: every level enabled'
+        Assert-Equal 3 $s.action 'and that is Full scrub (the uninstaller first), never KILL IT WITH FIRE by itself'
+        Assert-Equal 'True,True,True,True' (@($s.actionsEnabled) -join ',') 'no policy: every choice enabled once scanned'
+        Assert-Equal 'Test App 1.0   (Test Co, MSI)|True' "$($s.selectedText)|$($s.selectedBold)" 'the Selected box names the scanned app, in bold'
+        Assert-Equal $true ($s.scanText -like 'Scanned: 9 item(s)*Nothing changed yet*') 'step 2 says what the scan found and that nothing changed'
         Assert-Equal 'Registration,LogonHooks,Drivers,Services,Files,Registry' ((@($s.categories) | ForEach-Object { ($_ -split ' ')[0] }) -join ',') 'checklist rows (user data has its own box; report-only rows never show)'
         Assert-Equal $true ((@($s.categories) | Where-Object { $_ -like 'Files*' }) -like '*50.0 MB*') 'checklist shows sizes'
         Assert-Equal $true ((@($s.categories) | Where-Object { $_ -like 'Drivers*' }) -like '*+1 uncertain*') 'checklist counts uncertain (review) items apart'
@@ -579,26 +598,38 @@ try {
         Assert-Equal $false ([bool]$s.cleanEnabledWhileBusy) 'mid-run, ticking an option leaves Clean up off (no second run of the same plan)'
         Assert-Equal '' $s.policyLabel 'no policy label'
         Assert-Equal 'False|&Clean up|True' "$($s.killItChecked)|$($s.cleanText)|$($s.killItEnabled)" 'KILL IT starts unticked: the proper way is the default'
-        Assert-Equal $true ($null -ne $s.killIt) 'the KILL IT wiring was exercised'
+        Assert-Equal $true ($null -ne $s.killIt) 'the KILL IT WITH FIRE wiring was exercised'
         if ($s.killIt) {
-            Assert-Equal 3 $s.killIt.level 'ticking KILL IT from Scan only jumps to Full scrub'
+            Assert-Equal 3 $s.killIt.level 'KILL IT WITH FIRE runs at Full scrub''s level'
             Assert-Equal ".\KillItWithFire.ps1 -ProductCode '{DDC95F26-92B1-4546-9678-5DC68DF76BA0}' -KillIt -Force" $s.killIt.command 'and the command line says -KillIt'
-            Assert-Equal '&Kill it' $s.killIt.cleanText 'and the button says Kill it'
-            Assert-Equal 'False|&Clean up' "$($s.killIt.checkedAfterLevel1)|$($s.killIt.cleanTextAfterLevel1)" 'dropping to level 1 unticks it (nothing to kill there)'
+            Assert-Equal '&Kill it|True' "$($s.killIt.cleanText)|$($s.killIt.cleanHasImage)" 'and the button says Kill it, with the flame'
+            Assert-Equal 'False|&Clean up' "$($s.killIt.checkedAfterLevel1)|$($s.killIt.cleanTextAfterLevel1)" 'choosing Uninstall after it leaves no KILL IT behind'
+            Assert-Equal ".\KillItWithFire.ps1 -ProductCode '{DDC95F26-92B1-4546-9678-5DC68DF76BA0}' -Level 1 -Force" $s.killIt.commandAfterLevel1 'and no -KillIt or -SkipUninstall in the command line'
         }
         Assert-Equal $true ((Get-Item -LiteralPath (Join-Path $guiDir 'open.png')).Length -gt 10000) 'window rendered to a PNG'
+        Assert-Equal $true ((Get-Item -LiteralPath (Join-Path $guiDir 'open-killit.png')).Length -gt 10000) 'and again with KILL IT WITH FIRE chosen'
     }
     $s = & $runGui 'locked.json' (Join-Path $guiDir 'locked.png')
     Assert-Equal $true ($null -ne $s) 'window self-test ran (locked policy)'
     if ($s) {
-        Assert-Equal 'True,True,True,False' (@($s.levelsEnabled) -join ',') 'MaxLevel 2 greys out Full scrub'
-        Assert-Equal $false ([bool]$s.killItEnabled) 'MaxLevel 2 greys out KILL IT too (it is a full scrub)'
+        Assert-Equal 'True,True,False,False' (@($s.actionsEnabled) -join ',') 'MaxLevel 2 greys out Full scrub and KILL IT WITH FIRE (it is a full scrub), even after a scan'
+        Assert-Equal $false ([bool]$s.killItEnabled) 'MaxLevel 2: KILL IT WITH FIRE off'
         Assert-Equal 2 $s.level 'the highest allowed level is selected'
         Assert-Equal 2 $s.levelAfterScan 'a scan moves the window only as far as the policy allows'
         Assert-Equal 'True|False|True|False|\\srv\logs\|False|False' "$($s.backupChecked)|$($s.backupEnabled)|$($s.logChecked)|$($s.logEnabled)|$($s.logPath)|$($s.logPathEnabled)|$($s.userDataEnabled)" 'locked options are set and greyed out'
         Assert-Equal $true ($s.policyLabel -like 'Set by your administrator:*highest level 2*') 'the lock is labelled'
         Assert-Equal 'Registration' ((@($s.categories) | ForEach-Object { ($_ -split ' ')[0] }) -join ',') 'level 2 shows registration only'
         Assert-Equal ".\KillItWithFire.ps1 -ProductCode '{DDC95F26-92B1-4546-9678-5DC68DF76BA0}' -Level 2 -Log '\\srv\logs\' -Force" $s.command 'command line carries the locked log path'
+    }
+    # A refused scan offers nothing to run (the old window let you pick Uninstall and press Clean up anyway).
+    $refusedPlan = $testPlan | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+    $refusedPlan.refused = 'Microsoft app (test)'
+    ($refusedPlan | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath $planFile -Encoding UTF8
+    $s = & $runGui 'open.json' (Join-Path $guiDir 'refused.png')
+    Assert-Equal $true ($null -ne $s) 'window self-test ran (refused scan)'
+    if ($s) {
+        Assert-Equal 'False,False,False,False|False' "$((@($s.actionsEnabled) -join ','))|$($s.cleanEnabled)" 'a refused scan: no choice in step 3, no Clean up'
+        Assert-Equal 'Refused: Microsoft app (test)' $s.scanText 'and step 2 says why'
     }
     # -PolicyFile is refused outside the self-test: it can never stand in for an administrator's policy.
     & $hostExe -NoProfile -ExecutionPolicy Bypass -File $engine -Name 'x' -PolicyFile (Join-Path $guiDir 'open.json') *> $null

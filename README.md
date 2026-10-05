@@ -15,7 +15,7 @@ Removes a Windows app completely, the proper way or the hard way:
   uninstaller with no known silent switch is skipped rather than left waiting for a click, and one that
   stops on a prompt nobody can see anyway (a "quiet" command that still asks Yes/No) is stopped after a
   minute of waiting on it, with the prompt's text in the log. The cleanup then does the rest.
-- **KILL IT** (`-KillIt`, or the KILL IT box in the window): skip the uninstaller and scrub the app out.
+- **KILL IT** (`-KillIt`, or KILL IT WITH FIRE in the window): skip the uninstaller and scrub the app out.
   For an uninstaller that is broken, hangs, or wants a click nobody is there to give.
 
 What gets cleaned up: registration, services, drivers, device filters, network components, driver
@@ -111,12 +111,14 @@ quarantine for drive C:; other drives keep theirs in `<drive>:\.killitwithfire\<
 
 ## The window
 
-`.\KillItWithFire.ps1` with no arguments opens a Disk Cleanup-style window: pick the app, Scan, choose how
-far to go, untick categories (each shows its item count and size, and a description), choose the
-options, Clean up. Tick **KILL IT** and the level jumps to Full scrub, the uninstaller is skipped, and the
-button says "Kill it". Restore lists earlier runs. The window shows the equivalent command line for every
-choice, and it does nothing the command line can't: every action runs the same script as a child
-process with those switches.
+`.\KillItWithFire.ps1` with no arguments opens a Disk Cleanup-style window that runs in the order things
+happen: 1, pick the app (search the list); 2, Scan it (nothing else is offered until it is scanned); 3,
+choose how far to go (Uninstall, Registration cleanup, Full scrub or **KILL IT WITH FIRE**) and untick
+categories (each shows its item count and size, and a description); 4, options; then Clean up. A scan
+opens step 3 on Full scrub, the proper way: the app's own uninstaller still runs first. KILL IT WITH FIRE
+skips the uninstaller and the button says "Kill it". Restore lists earlier runs. The window shows the
+equivalent command line for every choice, and it does nothing the command line can't: every action runs
+the same script as a child process with those switches.
 
 ## Locking options (Group Policy, Intune)
 
