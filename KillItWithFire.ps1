@@ -2896,6 +2896,17 @@ function New-KillItWithFirePlan {
                         if (Test-WholeWord $p2 $kw) {
                             [void](Add-PlanItem -Category 'VendorRegistryKey' -Level 3 -Target (Format-RegPath $h "SOFTWARE\$n\$p2") -Action 'delete key' -Evidence "key $n\${p2}: the app's vendor and name" -Risk 'high' `
                                     -Op (New-RegOp -Kind 'RegDeleteKey' -Hive $h -Path "SOFTWARE\$n\$p2"))
+                            # Its twin in the other registry view, removed if it appears by the time the run gets
+                            # there: Firefox's own uninstaller CREATES WOW6432Node\Mozilla\Firefox while it runs, so a
+                            # scan before it never saw the key and it outlived the run (lab rerun, 2026-10-05). The
+                            # same name rule matches it; it only didn't exist yet. Absent then = skipped.
+                            $twin = if ($h -eq 'HKLM64') { 'HKLM32' } else { 'HKLM64' }
+                            $tk = Open-Key $twin "SOFTWARE\$n\$p2"
+                            if ($tk) { Close-Key $tk }
+                            elseif ((Get-KeyNativePath $twin 'SOFTWARE') -ne (Get-KeyNativePath $h 'SOFTWARE')) {
+                                [void](Add-PlanItem -Category 'VendorRegistryKey' -Level 3 -Target (Format-RegPath $twin "SOFTWARE\$n\$p2") -Action 'delete key if the uninstaller writes it' `
+                                        -Evidence "the other registry view of $n\$p2 (the app's vendor and name)" -Risk 'high' -Op (New-RegOp -Kind 'RegDeleteKey' -Hive $twin -Path "SOFTWARE\$n\$p2" -Optional))
+                            }
                         }
                     }
                     Close-Key $vk
