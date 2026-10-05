@@ -2006,8 +2006,11 @@ function New-KillItWithFirePlan {
     }
 
     # ---------------------------------------------------------------- the app's own programs still running
-    # Tied by image path only (its folder, or one of its own MSI files). Its services are left to the
-    # service items, which stop them properly.
+    # Tied by image path only (its folder, or one of its own MSI files). They are stopped AFTER the service
+    # items (order 316 vs 315), so a service is still stopped properly first, and this only catches what
+    # outlives it. A program sharing a service's image used to be skipped as "the service's own": WireGuard's
+    # manager service stopped cleanly, another wireguard.exe kept running, and the folder could only go at the
+    # next boot (lab rerun, 2026-10-05).
     $svcImages = @($ourServices | ForEach-Object { $_.Svc.Image } | Where-Object { $_ })
     $ancestors = Get-ProcessAncestry
     $procGroups = @{}
@@ -2015,14 +2018,15 @@ function New-KillItWithFirePlan {
         if ($ancestors.Contains($p.Id)) { continue }
         $pp = $null
         try { $pp = $p.Path } catch { }
-        if (-not $pp -or ($svcImages -contains $pp) -or -not (Test-OurReference $pp)) { continue }
+        if (-not $pp -or -not (Test-OurReference $pp)) { continue }
         if (-not $procGroups.ContainsKey($pp)) { $procGroups[$pp] = 0 }
         $procGroups[$pp]++
     }
     foreach ($pp in $procGroups.Keys) {
         $inWin = Test-PathUnder $pp $env:SystemRoot
+        $ev = if ($svcImages -contains $pp) { "the app's service program: whatever still runs it after the service has stopped" } else { "runs from the app's own folder or files" }
         [void](Add-PlanItem -Category 'RunningProcess' -Level 3 -Target "program $pp" -Action "stop it ($($procGroups[$pp]) running now); unsaved work in it is lost, and a restore does not restart it" `
-                -Evidence "runs from the app's own folder or files" -Risk 'high' -Review:$inWin -Note $(if ($inWin) { 'needs review: a program under C:\Windows that one MSI claims' } else { $null }) `
+                -Evidence $ev -Risk 'high' -Review:$inWin -Note $(if ($inWin) { 'needs review: a program under C:\Windows that one MSI claims' } else { $null }) `
                 -Op ([ordered]@{ kind = 'ProcessStop'; path = $pp }))
     }
 
