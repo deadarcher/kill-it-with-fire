@@ -653,7 +653,7 @@ function Get-RefusalReason {
 
 # What -Include/-Exclude and the window's checklist work in. AppData (UserData) is always opt-in.
 $script:Categories = [ordered]@{
-    Registration = @('UninstallEntry', 'MsiProduct', 'MsiUpgradeCode', 'MsiComponentClient', 'MsiPatch', 'MsiFolderEntry', 'MsiDependency', 'MsiCachedPackage')
+    Registration = @('UninstallEntry', 'MsiProduct', 'MsiUpgradeCode', 'MsiComponentClient', 'MsiPatch', 'MsiFolderEntry', 'MsiDependency', 'MsiCachedPackage', 'UpdaterRegistration')
     LogonHooks   = @('PasswordProviderRestore', 'CredentialProviderFilter', 'CredentialProvider', 'Winlogon', 'LsaPackage', 'NetworkProvider', 'AppInitDll', 'IfeoDebugger', 'WinsockProvider')
     Drivers      = @('DeviceClassFilter', 'DeviceInstanceFilter', 'NetworkComponent', 'DriverPackage', 'Driver')
     Services     = @('Service', 'RunningProcess')
@@ -682,7 +682,7 @@ $script:CategoryLabels = [ordered]@{
 # Device filters come before the driver they name, or every device in the class dies at the next boot.
 $script:Order = @{
     UninstallEntry = 110; MsiProduct = 120; MsiUpgradeCode = 130; MsiComponentClient = 140; MsiPatch = 150
-    MsiFolderEntry = 160; MsiDependency = 165; MsiCachedPackage = 170
+    MsiFolderEntry = 160; MsiDependency = 165; MsiCachedPackage = 170; UpdaterRegistration = 175
     PasswordProviderRestore = 300; CredentialProviderFilter = 301; CredentialProvider = 302; Winlogon = 303
     LsaPackage = 304; NetworkProvider = 305; AppInitDll = 306; IfeoDebugger = 307; WinsockProvider = 308
     # User-mode services stop BEFORE the drivers they hold open, so a driver can unload without a reboot.
@@ -2678,6 +2678,22 @@ function New-KillItWithFirePlan {
     foreach ($m in $matched | Where-Object { $_.KeyPath }) {
         [void](Add-PlanItem -Category 'UninstallEntry' -Level 2 -Scope $(if ($m.Sid) { "user:$($m.Sid)" } else { 'machine' }) -Target $m.Display -Action 'delete key' `
                 -Evidence "the uninstall entry for '$($m.DisplayName)' $($m.DisplayVersion)" -Op (New-RegOp -Kind 'RegDeleteKey' -Hive $m.Hive -Path $m.KeyPath))
+        # Google Update (Omaha) keeps its own record of an app it manages, keyed by the SAME GUID as the app's
+        # uninstall entry: Update\Clients\{GUID} (name, pv) and ClientState\{GUID}. Left behind by KILL IT,
+        # Google Drive's installer read it, decided "131.0.2.0 is already installed" and refused to reinstall
+        # (1638, lab rerun 2026-10-05). The GUID is the evidence: nothing else is keyed by it.
+        if (-not $m.Sid -and (Test-IsGuid $m.KeyName)) {
+            foreach ($h in @('HKLM64', 'HKLM32')) {
+                foreach ($sub in @('Clients', 'ClientState', 'ClientStateMedium')) {
+                    $up = "SOFTWARE\Google\Update\$sub\$($m.KeyName)"
+                    $uk = Open-Key $h $up
+                    if (-not $uk) { continue }
+                    $nm = [string](Get-ValueSafe $uk 'name'); Close-Key $uk
+                    [void](Add-PlanItem -Category 'UpdaterRegistration' -Level 2 -Target (Format-RegPath $h $up) -Action 'delete key' `
+                            -Evidence "Google Update's record of this app (the same GUID as its uninstall entry$(if ($nm) { ", name '$nm'" }))" -Op (New-RegOp -Kind 'RegDeleteKey' -Hive $h -Path $up))
+                }
+            }
+        }
     }
     $patchRefs = @{}
     if ($msiRegistration | Where-Object { $_.What -eq 'patch' }) {
