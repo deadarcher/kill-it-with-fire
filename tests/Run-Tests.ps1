@@ -706,6 +706,29 @@ try {
     Assert-Equal $false (Test-KeyExpectation 'HKU' $pk $exp) 'ProgID: its open command now runs another program: kept'
     $k = $hkuBase.CreateSubKey("$pk\CLSID"); $k.SetValue('', '{99999999-2222-3333-4444-555555555555}'); $k.Close()
     Assert-Equal $false (Test-KeyExpectation 'HKU' $pk $exp) 'ProgID: re-pointed at another class: kept'
+    # Two of OUR classes share one ProgID (Adobe Reader's AcroExch.PDDoc, lab sweep 2026-10-05).
+    $two = @{ sub = 'CLSID'; value = '{11111111-2222-3333-4444-555555555555}'; values = @('{11111111-2222-3333-4444-555555555555}', '{99999999-2222-3333-4444-555555555555}') }
+    Assert-Equal $true (Test-KeyExpectation 'HKU' $pk $two) 'ProgID shared by two of our classes: pointing at the second one is still ours'
+    Assert-Equal $true (Test-KeyExpectation 'HKU' $pk ($two | ConvertTo-Json | ConvertFrom-Json)) '... the same from a plan.json read back'
+    # A key name with "/" in it (Adobe's MimeTypes\application/pdf): Split-Path would split there too.
+    Assert-Equal 'A\MimeTypes|application/pdf' ((Split-RegPath 'A\MimeTypes\application/pdf') -join '|') 'registry path split: "/" is part of a key name'
+    Assert-Equal '|Top' ((Split-RegPath 'Top') -join '|') 'registry path split: a top-level name has no parent'
+    $mk = "$tk\MimeTypes\application/pdf"
+    $k = $hkuBase.CreateSubKey($mk); $k.SetValue('', 'x'); $k.Close()
+    Assert-Equal $true ($null -ne $hkuBase.OpenSubKey($mk)) 'a key named application/pdf exists (precondition)'
+    # The exact change that stopped Adobe's KILL IT run: delete its default value, then the emptied key.
+    $jr = Join-Path ([System.IO.Path]::GetTempPath()) ('killitwithfire-run-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $jr -Force | Out-Null
+    $savedRun = $script:Run
+    try {
+        $script:Run = [pscustomobject]@{ RunId = 'test'; Root = $jr; Backups = $jr; Journal = (Join-Path $jr 'journal.jsonl'); Seq = 0; Backup = $false; LogFile = $null }
+        $res = Invoke-PrimitiveOp 1 (New-RegOp -Kind 'RegDeleteValue' -Hive 'HKU' -Path $mk -ValueName '' -DeleteKeyIfEmpty) 'MsiRegistryValue'
+        Assert-Equal 'done' $res 'a value in a key named application/pdf is deleted (the run used to stop here)'
+        Assert-Equal $true ($null -eq $hkuBase.OpenSubKey($mk)) '... and the emptied key goes with it'
+        $k = $hkuBase.CreateSubKey("$mk\sub"); $k.Close()
+        $res = Invoke-PrimitiveOp 2 (New-RegOp -Kind 'RegDeleteKey' -Hive 'HKU' -Path $mk) 'VendorRegistryKey'
+        Assert-Equal $true ($res -eq 'done' -and $null -eq $hkuBase.OpenSubKey($mk) -and $null -ne $hkuBase.OpenSubKey("$tk\MimeTypes")) 'a key named application/pdf is deleted whole, and its parent stays'
+    } finally { $script:Run = $savedRun; Remove-Item -LiteralPath $jr -Recurse -Force -ErrorAction SilentlyContinue }
 } finally {
     try { $hkuBase.DeleteSubKeyTree($tk, $false) } catch { }
     $hkuBase.Close()

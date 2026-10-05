@@ -472,6 +472,16 @@ function Get-ParentPath {
     return $Path.Substring(0, $i)
 }
 
+function Split-RegPath {
+    # "A\B\c/d" -> @('A\B', 'c/d'). Never Split-Path on a registry path: it splits on "/" too, and key names
+    # may hold one. Adobe Reader's "MozillaPlugins\Adobe Acrobat\MimeTypes\application/pdf" sent a run to the
+    # parent "...\MimeTypes\application", which doesn't exist, and stopped it (lab sweep, 2026-10-05).
+    param([string] $Path)
+    $i = $Path.LastIndexOf('\')
+    if ($i -lt 0) { return @('', $Path) }
+    return @($Path.Substring(0, $i), $Path.Substring($i + 1))
+}
+
 function Test-HoldsProgramFiles {
     # Does a folder hold programs (.exe, .dll, .sys) anywhere in its first 20,000 files? It decides what is
     # KEPT, so doubt keeps: unreadable, or too big to tell, counts as yes.
@@ -2151,7 +2161,16 @@ function New-KillItWithFirePlan {
                     $progId = [string]$ci.ProgId
                     [void](Add-PlanItem -Category 'ComClass' -Level 3 -Scope $src.Scope -Target (Format-RegPath $src.Hive "$($src.Path)\CLSID\$clsid") `
                             -Action 'delete key' -Evidence "$server = $val (points at the app)" -Op (New-RegOp -Kind 'RegDeleteKey' -Hive $src.Hive -Path "$($src.Path)\CLSID\$clsid"))
-                    if ($progId) {
+                    $pgTarget = if ($progId) { Format-RegPath $src.Hive "$($src.Path)\$progId" } else { $null }
+                    # One ProgID can name two of OUR classes (Adobe Reader's AcroExch.PDDoc, 32- and 64-bit): the
+                    # key goes when it points at EITHER. The first class found used to be the only one accepted,
+                    # and KILL IT left AcroExch.PDDoc behind as "no longer ours" (lab sweep, 2026-10-05).
+                    $sameProgId = if ($pgTarget) { @($script:Items | Where-Object { $_.category -eq 'ComProgId' -and $_.target -eq $pgTarget }) | Select-Object -First 1 } else { $null }
+                    if ($sameProgId) {
+                        $ex = $sameProgId.op.expect
+                        if (-not $ex.ContainsKey('values')) { $ex.values = @([string]$ex.value) }
+                        if ($ex.values -notcontains $clsid) { $ex.values += $clsid }
+                    } elseif ($progId) {
                         [void]$ourClassKeys.Add($progId)
                         # What else the ProgID points at. When all of it is the app's, the key may also go once
                         # the app's own uninstaller has cut its CLSID link (Test-KeyExpectation).
@@ -3591,7 +3610,13 @@ function Test-KeyExpectation {
     $k = Open-Key $Hive "$Path\$($Expect.sub)"
     $v = [string](Get-ValueSafe $k '')
     Close-Key $k
-    if ($v.Trim()) { return ($v.Trim().Equals(([string]$Expect.value).Trim(), [StringComparison]::OrdinalIgnoreCase)) }
+    if ($v.Trim()) {
+        # Any of our classes that share this ProgID (values), or the one (value) on an older plan.
+        $ours = @(Get-Prop $Expect 'values' | Where-Object { $_ })
+        if (-not $ours.Count) { $ours = @([string]$Expect.value) }
+        foreach ($c in $ours) { if ($v.Trim().Equals(([string]$c).Trim(), [StringComparison]::OrdinalIgnoreCase)) { return $true } }
+        return $false
+    }
     # The CLSID link is gone: the app's own uninstaller took it and left the rest of the ProgID behind
     # (Foxit PDF Reader's four FoxitReader.* keys, lab sweep 2026-10-03). Still ours only when the scan saw
     # every command and icon in it pointing at the app (orphanRefs), and nothing new has moved in since.
@@ -3631,8 +3656,9 @@ function Invoke-PrimitiveOp {
             $expect = Get-Prop $Op 'expect'
             if ($expect -and -not (Test-KeyExpectation $Op.hive $Op.path $expect)) { $rec.result = 'skipped'; $rec.note = 'no longer points at our class'; break }
             if ($script:Run.Backup) { $f = Join-Path $bk "$tag.reg"; Export-RegKeyBackup $Op.hive $Op.path $f; $rec.backup = $f }
-            $parentPath = Split-Path $Op.path -Parent; $leaf = Split-Path $Op.path -Leaf
+            $parentPath, $leaf = Split-RegPath ([string]$Op.path)
             $parent = Open-Key $Op.hive $parentPath -Writable
+            if (-not $parent) { throw "parent key not found: $(Format-RegPath $Op.hive $parentPath)" }
             try { $parent.DeleteSubKeyTree($leaf, $false) } finally { Close-Key $parent }
             if (Open-Key $Op.hive $Op.path) { throw "key still present: $(Format-RegPath $Op.hive $Op.path)" }
             $rec.result = 'done'
@@ -3650,9 +3676,12 @@ function Invoke-PrimitiveOp {
                 $empty = ($k.ValueCount -eq 0 -and $k.SubKeyCount -eq 0)
             } finally { Close-Key $k }
             if ($delKey -and $empty) {
-                $parent = Open-Key $Op.hive (Split-Path $Op.path -Parent) -Writable
-                try { $parent.DeleteSubKey((Split-Path $Op.path -Leaf), $false) } finally { Close-Key $parent }
-                $rec.note = 'the key was left empty and was removed too'
+                $pp, $leaf = Split-RegPath ([string]$Op.path)
+                $parent = Open-Key $Op.hive $pp -Writable
+                if ($parent) {
+                    try { $parent.DeleteSubKey($leaf, $false) } finally { Close-Key $parent }
+                    $rec.note = 'the key was left empty and was removed too'
+                }
             }
             $rec.result = 'done'
         }
@@ -3706,8 +3735,9 @@ function Invoke-PrimitiveOp {
                     $empty = ($k.ValueCount -eq 0 -and $k.SubKeyCount -eq 0)
                 } finally { Close-Key $k }
                 if ($empty) {
-                    $parent = Open-Key 'HKLM64' (Split-Path $p -Parent) -Writable
-                    try { $parent.DeleteSubKey((Split-Path $p -Leaf), $false) } finally { Close-Key $parent }
+                    $pp, $leaf = Split-RegPath $p
+                    $parent = Open-Key 'HKLM64' $pp -Writable
+                    if ($parent) { try { $parent.DeleteSubKey($leaf, $false) } finally { Close-Key $parent } }
                 }
             }
             $rec.note = "$done client value(s) removed"
