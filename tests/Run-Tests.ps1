@@ -732,6 +732,41 @@ try {
         $res = Invoke-PrimitiveOp 2 (New-RegOp -Kind 'RegDeleteKey' -Hive 'HKU' -Path $mk) 'VendorRegistryKey'
         Assert-Equal $true ($res -eq 'done' -and $null -eq $hkuBase.OpenSubKey($mk) -and $null -ne $hkuBase.OpenSubKey("$tk\MimeTypes")) 'a key named application/pdf is deleted whole, and its parent stays'
     } finally { $script:Run = $savedRun; Remove-Item -LiteralPath $jr -Recurse -Force -ErrorAction SilentlyContinue }
+
+    # A key the app's tree holds but this account may not delete (Chrome's key holds Windows' own
+    # NativeMessagingHosts\com.microsoft.browsercore, locked against Administrators: lab re-test 2026-10-05).
+    # Deny ourselves Delete on one subkey, then delete the tree around it, back up only what goes, restore it.
+    $ck = "$tk\Chrome"
+    $k = $hkuBase.CreateSubKey($ck); $k.SetValue('version', '1'); $k.Close()
+    $k = $hkuBase.CreateSubKey("$ck\Prefs"); $k.SetValue('a', 'b'); $k.Close()
+    $k = $hkuBase.CreateSubKey("$ck\NativeMessagingHosts\com.app.own"); $k.SetValue('', 'x'); $k.Close()
+    $k = $hkuBase.CreateSubKey("$ck\NativeMessagingHosts\com.microsoft.browsercore"); $k.SetValue('', 'windows'); $k.Close()
+    $who = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $locked = $hkuBase.OpenSubKey("$ck\NativeMessagingHosts\com.microsoft.browsercore", [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, [System.Security.AccessControl.RegistryRights]::ChangePermissions -bor [System.Security.AccessControl.RegistryRights]::ReadKey)
+    $acl = $locked.GetAccessControl()
+    $deny = New-Object System.Security.AccessControl.RegistryAccessRule($who, [System.Security.AccessControl.RegistryRights]'SetValue, CreateSubKey, Delete', 'Deny')
+    $acl.AddAccessRule($deny); $locked.SetAccessControl($acl); $locked.Close()
+    $jr = Join-Path ([System.IO.Path]::GetTempPath()) ('killitwithfire-run-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $jr -Force | Out-Null
+    $savedRun = $script:Run
+    try {
+        Assert-Equal "$ck\NativeMessagingHosts\com.microsoft.browsercore" (@(Get-UndeletableSubKeys 'HKU' $ck) -join '|') 'the subkey this account may not delete is found (and only it)'
+        Assert-Equal 0 @(Get-UndeletableSubKeys 'HKU' "$ck\Prefs").Count 'a tree with nothing locked has none (never a phantom one)'
+        $script:Run = [pscustomobject]@{ RunId = 'test'; Root = $jr; Backups = $jr; Journal = (Join-Path $jr 'journal.jsonl'); Seq = 0; Backup = $true; LogFile = $null }
+        $res = Invoke-PrimitiveOp 3 (New-RegOp -Kind 'RegDeleteKey' -Hive 'HKU' -Path $ck) 'VendorRegistryKey'
+        Assert-Equal 'done' $res 'a key holding a locked subkey is deleted around it (the run used to stop here)'
+        Assert-Equal $true ($null -eq $hkuBase.OpenSubKey("$ck\Prefs") -and $null -eq $hkuBase.OpenSubKey("$ck\NativeMessagingHosts\com.app.own")) '... everything else in it is gone'
+        Assert-Equal $true ($null -ne $hkuBase.OpenSubKey("$ck\NativeMessagingHosts\com.microsoft.browsercore")) '... the locked subkey stays'
+        Assert-Equal 0 @($hkuBase.OpenSubKey($ck).GetValueNames()).Count '... and the key that holds it keeps none of its own values'
+        $rec = @(Get-JournalRecords (Join-Path $jr 'journal.jsonl'))[-1]
+        Assert-Equal $true ((Get-Content -LiteralPath $rec.backup -Raw) -notmatch 'browsercore') '... and the backup leaves the locked subkey out (a restore must not touch it)'
+        Invoke-RegImport $rec.backup
+        Assert-Equal '1|b|x' ("{0}|{1}|{2}" -f $hkuBase.OpenSubKey($ck).GetValue('version'), $hkuBase.OpenSubKey("$ck\Prefs").GetValue('a'), $hkuBase.OpenSubKey("$ck\NativeMessagingHosts\com.app.own").GetValue('')) 'restoring that backup brings back everything the run removed'
+    } finally {
+        $script:Run = $savedRun; Remove-Item -LiteralPath $jr -Recurse -Force -ErrorAction SilentlyContinue
+        # Take our deny back off, so the scratch key can be deleted.
+        try { $locked = $hkuBase.OpenSubKey("$ck\NativeMessagingHosts\com.microsoft.browsercore", [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, [System.Security.AccessControl.RegistryRights]::ChangePermissions -bor [System.Security.AccessControl.RegistryRights]::ReadKey); $acl = $locked.GetAccessControl(); [void]$acl.RemoveAccessRule($deny); $locked.SetAccessControl($acl); $locked.Close() } catch { }
+    }
 } finally {
     try { $hkuBase.DeleteSubKeyTree($tk, $false) } catch { }
     $hkuBase.Close()

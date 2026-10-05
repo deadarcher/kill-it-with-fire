@@ -3651,6 +3651,80 @@ function ConvertTo-StringMap {
     return $h
 }
 
+function Get-UndeletableSubKeys {
+    # Subkeys of a key tree this account may not delete (no write or delete right): Windows can own a key
+    # INSIDE an app's key. Chrome's NativeMessagingHosts\com.microsoft.browsercore is Windows' sign-in hook,
+    # locked against Administrators, and deleting Chrome's key whole stopped the run (lab re-test, 2026-10-05).
+    # Returns their paths, written like $Path. Bounded: 2,000 keys.
+    param([string] $Hive, [string] $Path)
+    $out = New-Object System.Collections.Generic.List[string]
+    $stack = New-Object System.Collections.Generic.Stack[string]
+    $stack.Push($Path)
+    $seen = 0
+    $rights = [System.Security.AccessControl.RegistryRights]'ReadKey, SetValue, CreateSubKey, Delete'
+    while ($stack.Count -and $seen -lt 2000) {
+        $p = $stack.Pop(); $seen++
+        $k = Open-Key $Hive $p
+        if (-not $k) { continue }
+        foreach ($s in (Get-SubKeyNamesSafe $k)) {
+            $sk = $null; $denied = $false
+            try { $sk = $k.OpenSubKey($s, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, $rights) } catch { $denied = $true }
+            if ($denied) { $out.Add("$p\$s"); continue }
+            if ($null -eq $sk) { continue }   # gone since it was listed
+            $sk.Close()
+            $stack.Push("$p\$s")
+        }
+        Close-Key $k
+    }
+    # Unwrapped: the caller counts @(...), and @() over a ", array" return counts 1 even when it is empty.
+    return $out.ToArray()
+}
+
+function Remove-RegTreeExcept {
+    # Deletes a key tree except the given subkeys. A key that still holds one of them stays, emptied of its own
+    # values, so only the protected subkey survives. Throws on any other failure.
+    param([string] $Hive, [string] $Path, [string[]] $Keep)
+    $k = Open-Key $Hive $Path -Writable
+    if (-not $k) { return }
+    $holds = $false
+    try {
+        foreach ($s in @(Get-SubKeyNamesSafe $k)) {
+            $sp = "$Path\$s"
+            if ($Keep -contains $sp) { $holds = $true; continue }
+            if (@($Keep | Where-Object { $_.StartsWith($sp + '\', [StringComparison]::OrdinalIgnoreCase) }).Count) { Remove-RegTreeExcept $Hive $sp $Keep; $holds = $true; continue }
+            $k.DeleteSubKeyTree($s, $false)
+        }
+        if ($holds) { foreach ($v in @(Get-ValueNamesSafe $k)) { $k.DeleteValue($v, $false) } }
+    } finally { Close-Key $k }
+    if (-not $holds) {
+        $pp, $leaf = Split-RegPath $Path
+        $parent = Open-Key $Hive $pp -Writable
+        if ($parent) { try { $parent.DeleteSubKey($leaf, $false) } finally { Close-Key $parent } }
+    }
+}
+
+function Export-RegTreeBackup {
+    # A key tree as .reg text, without the given subkeys and what is under them: the backup of a delete that had
+    # to keep them, so a restore writes back only what the run removed (and never touches what it could not).
+    param([string] $Hive, [string] $Path, [string[]] $Keep, [string] $File)
+    $keys = New-Object System.Collections.Generic.List[object]
+    $stack = New-Object System.Collections.Generic.Stack[string]
+    $stack.Push($Path)
+    while ($stack.Count) {
+        $p = $stack.Pop()
+        $k = Open-Key $Hive $p
+        if (-not $k) { continue }
+        $vals = @()
+        foreach ($n in (Get-ValueNamesSafe $k)) {
+            $vals += @{ Name = $n; Kind = $k.GetValueKind($n).ToString(); Data = $k.GetValue($n, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) }
+        }
+        $keys.Add(@{ Path = (Get-PhysicalRegPath $Hive $p); Values = $vals })
+        foreach ($s in @(Get-SubKeyNamesSafe $k)) { if ($Keep -notcontains "$p\$s") { $stack.Push("$p\$s") } }
+        Close-Key $k
+    }
+    [System.IO.File]::WriteAllText($File, (ConvertTo-RegFileText $keys.ToArray()), [System.Text.Encoding]::Unicode)
+}
+
 function Test-KeyExpectation {
     param([string] $Hive, [string] $Path, $Expect)
     if (-not $Expect) { return $true }
@@ -3706,6 +3780,17 @@ function Invoke-PrimitiveOp {
                 # AcroExch.PDDoc, lab re-test 2026-10-05).
                 $ck = Open-Key $Op.hive "$($Op.path)\$($expect.sub)"; $nowAt = [string](Get-ValueSafe $ck ''); Close-Key $ck
                 $rec.result = 'skipped'; $rec.note = "no longer points at our class$(if ($nowAt) { " (its $($expect.sub) is $nowAt)" })"; break
+            }
+            # A subkey this account may not delete (Windows' own, inside the app's key): delete AROUND it, with a
+            # backup of only what goes (Get-UndeletableSubKeys).
+            $keep = @(Get-UndeletableSubKeys $Op.hive $Op.path)
+            if ($keep.Count) {
+                if ($script:Run.Backup) { $f = Join-Path $bk "$tag.reg"; Export-RegTreeBackup $Op.hive $Op.path $keep $f; $rec.backup = $f }
+                Remove-RegTreeExcept $Op.hive $Op.path $keep
+                $rec.kept = $keep
+                $rec.note = "kept $($keep.Count) subkey(s) this account may not delete, so not the app's: $(@($keep | ForEach-Object { @(Split-RegPath $_)[1] }) -join ', ')"
+                $rec.result = 'done'
+                break
             }
             if ($script:Run.Backup) { $f = Join-Path $bk "$tag.reg"; Export-RegKeyBackup $Op.hive $Op.path $f; $rec.backup = $f }
             $parentPath, $leaf = Split-RegPath ([string]$Op.path)
