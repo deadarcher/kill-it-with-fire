@@ -2801,7 +2801,11 @@ function New-KillItWithFirePlan {
         if ($root -in @('2', '-1')) { $regExact += [pscustomobject]@{ Hive = $view; Key = $key; Value = $vname; Why = "written by the app's MSI (Registry table, component $comp)" } }
         elseif ($root -eq '0') { $regExact += [pscustomobject]@{ Hive = $view; Key = "SOFTWARE\Classes\$key"; Value = $vname; Why = "written by the app's MSI (Registry table, component $comp)" } }
     }
-    $skipRegAreas = '^(?i)(SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall|SOFTWARE\\Classes\\(CLSID|TypeLib|Interface|AppID|Installer)|SYSTEM\\)'
+    # Classes\MIME\Database too (2026-10-05): Windows' content-type -> extension map is SHARED. Adobe Reader,
+    # Foxit and LibreOffice each write "Extension" under types like application/pdf and the .docx type, which
+    # Windows and Office register as well: removing one app must not unmap the type for the rest. A value
+    # left there is a harmless mapping.
+    $skipRegAreas = '^(?i)(SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall|SOFTWARE\\Classes\\(CLSID|TypeLib|Interface|AppID|Installer|MIME\\Database)|SYSTEM\\)'
     # What other items already remove, by real location: a value inside a key that a COM or shell item
     # deletes whole, or the very value a shell-extension item deletes, is NOT planned a second time. The
     # duplicate made "-Exclude Registry" still lose those values through the other category (lab
