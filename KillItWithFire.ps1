@@ -3659,7 +3659,22 @@ function Invoke-PrimitiveOp {
             $parentPath, $leaf = Split-RegPath ([string]$Op.path)
             $parent = Open-Key $Op.hive $parentPath -Writable
             if (-not $parent) { throw "parent key not found: $(Format-RegPath $Op.hive $parentPath)" }
-            try { $parent.DeleteSubKeyTree($leaf, $false) } finally { Close-Key $parent }
+            try {
+                # Something else may be deleting inside the same tree at the same moment: Google's updater cleans
+                # up HKLM\SOFTWARE\Google\Chrome right after Chrome's own uninstaller, a subkey vanishes mid-walk,
+                # and .NET throws "subkey does not exist" even with throwOnMissingSubKey off (lab rerun,
+                # 2026-10-05: the run stopped there). Gone is the goal, so walk it again.
+                for ($try = 1; ; $try++) {
+                    try { $parent.DeleteSubKeyTree($leaf, $false); break }
+                    catch {
+                        $still = Open-Key $Op.hive $Op.path
+                        if (-not $still) { break }
+                        Close-Key $still
+                        if ($try -ge 5) { throw }
+                        Start-Sleep -Milliseconds 500
+                    }
+                }
+            } finally { Close-Key $parent }
             if (Open-Key $Op.hive $Op.path) { throw "key still present: $(Format-RegPath $Op.hive $Op.path)" }
             $rec.result = 'done'
         }
