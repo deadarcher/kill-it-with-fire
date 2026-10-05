@@ -2174,26 +2174,29 @@ function New-KillItWithFirePlan {
                 if ($val -and (Test-OurReference $val)) {
                     $isOurs = $true
                     [void]$ourClsids.Add($clsid)
-                    $progId = [string]$ci.ProgId
                     [void](Add-PlanItem -Category 'ComClass' -Level 3 -Scope $src.Scope -Target (Format-RegPath $src.Hive "$($src.Path)\CLSID\$clsid") `
                             -Action 'delete key' -Evidence "$server = $val (points at the app)" -Op (New-RegOp -Kind 'RegDeleteKey' -Hive $src.Hive -Path "$($src.Path)\CLSID\$clsid"))
-                    $pgTarget = if ($progId) { Format-RegPath $src.Hive "$($src.Path)\$progId" } else { $null }
-                    # One ProgID can name two of OUR classes (Adobe Reader's AcroExch.PDDoc, 32- and 64-bit): the
-                    # key goes when it points at EITHER. The first class found used to be the only one accepted,
-                    # and KILL IT left AcroExch.PDDoc behind as "no longer ours" (lab sweep, 2026-10-05).
-                    $sameProgId = if ($pgTarget) { @($script:Items | Where-Object { $_.category -eq 'ComProgId' -and $_.target -eq $pgTarget }) | Select-Object -First 1 } else { $null }
-                    if ($sameProgId) {
-                        $ex = $sameProgId.op.expect
-                        if (-not $ex.ContainsKey('values')) { $ex.values = @([string]$ex.value) }
-                        if ($ex.values -notcontains $clsid) { $ex.values += $clsid }
-                    } elseif ($progId) {
+                    # Both names COM gives a class: its ProgID and its version-independent ProgID (AcroExch.PDDoc.1 and
+                    # AcroExch.PDDoc). Adobe Reader's KILL IT left AcroExch.PDDoc pointing at {FF76CB60-...}, a class of
+                    # ours that names it only as VersionIndependentProgID (lab re-test, 2026-10-05).
+                    foreach ($progId in @(@([string]$ci.ProgId, [string]$ci.VersionIndependentProgId) | Where-Object { $_ } | Select-Object -Unique)) {
+                        $pgTarget = Format-RegPath $src.Hive "$($src.Path)\$progId"
+                        # One ProgID can name two of OUR classes (Adobe Reader's AcroExch.PDDoc, 32- and 64-bit): the
+                        # key goes when it points at EITHER, not only at the first class found (lab sweep, 2026-10-05).
+                        $sameProgId = @($script:Items | Where-Object { $_.category -eq 'ComProgId' -and $_.target -eq $pgTarget }) | Select-Object -First 1
+                        if ($sameProgId) {
+                            $ex = $sameProgId.op.expect
+                            if (-not $ex.ContainsKey('values')) { $ex.values = @([string]$ex.value) }
+                            if ($ex.values -notcontains $clsid) { $ex.values += $clsid }
+                            continue
+                        }
                         [void]$ourClassKeys.Add($progId)
                         # What else the ProgID points at. When all of it is the app's, the key may also go once
                         # the app's own uninstaller has cut its CLSID link (Test-KeyExpectation).
                         $expect = @{ sub = 'CLSID'; value = $clsid }
                         $refs = Get-ProgIdRefs $src.Hive "$($src.Path)\$progId"
                         if (-not @($refs.Values | Where-Object { -not (Test-OurReference $_) }).Count) { $expect.orphanRefs = $refs }
-                        [void](Add-PlanItem -Category 'ComProgId' -Level 3 -Scope $src.Scope -Target (Format-RegPath $src.Hive "$($src.Path)\$progId") `
+                        [void](Add-PlanItem -Category 'ComProgId' -Level 3 -Scope $src.Scope -Target $pgTarget `
                                 -Action 'delete key (only while it still points at our class, or at nothing else)' -Evidence "ProgID of our class $clsid" `
                                 -Op (New-RegOp -Kind 'RegDeleteKey' -Hive $src.Hive -Path "$($src.Path)\$progId" -Expect $expect -Optional))
                     }
@@ -3405,7 +3408,7 @@ static string DefaultOf(RegistryKey parent, string sub) {
     if (k == null) { return null; }
     using (k) { try { return AsText(k.GetValue("", null)); } catch { return null; } }
 }
-public sealed class ComClassInfo { public string Clsid; public string AppId; public string InprocServer32; public string LocalServer32; public string InprocHandler32; public string ProgId; }
+public sealed class ComClassInfo { public string Clsid; public string AppId; public string InprocServer32; public string LocalServer32; public string InprocHandler32; public string ProgId; public string VersionIndependentProgId; }
 public sealed class ComClassList { public List<ComClassInfo> Items = new List<ComClassInfo>(); public int Unreadable; }
 // Every class under a CLSID key: its AppID and the default values of its server and ProgID subkeys.
 public static ComClassList ReadComClasses(RegistryKey clsidRoot) {
@@ -3424,6 +3427,7 @@ public static ComClassList ReadComClasses(RegistryKey clsidRoot) {
             info.LocalServer32 = DefaultOf(ck, "LocalServer32");
             info.InprocHandler32 = DefaultOf(ck, "InprocHandler32");
             info.ProgId = DefaultOf(ck, "ProgID");
+            info.VersionIndependentProgId = DefaultOf(ck, "VersionIndependentProgID");
             list.Items.Add(info);
         }
     }
