@@ -364,6 +364,9 @@ Update-AppList $lui $fx
 Assert-Equal 'alpha' ((@($lv.Items) | Where-Object { $_.Selected } | ForEach-Object { $_.Text }) -join ',') 'window list: re-sorting keeps the selected app selected'
 Assert-Equal $false $lui.Filling 'window list: the selection handler is live again afterwards'
 $lv.Dispose()
+Assert-Equal $true (Test-SameEntry $fx[1] ([pscustomobject]@{ KeyPath = 'k\alpha'; Hive = 'HKLM32' })) 'same entry: one key in one hive'
+Assert-Equal $false (Test-SameEntry $fx[1] ([pscustomobject]@{ KeyPath = 'k\alpha'; Hive = 'HKLM64' })) 'same entry: the same key name in the other view is another app'
+Assert-Equal $false (Test-SameEntry $fx[1] $null) 'same entry: nothing picked is never the scanned app'
 Assert-Equal 'dotPDN LLC' (Select-SignerOrg @{ 'Microsoft Corporation' = 3; 'dotPDN LLC' = 1 }) 'signer: a third-party app bundling Microsoft-signed runtime files is still its vendor''s (paint.net)'
 Assert-Equal 'Microsoft Corporation' (Select-SignerOrg @{ 'Microsoft Corporation' = 2 }) 'signer: all Microsoft-signed is Microsoft (the refusal still holds)'
 Assert-Equal $null (Select-SignerOrg @{}) 'signer: nothing signed, no signer'
@@ -573,6 +576,7 @@ try {
         Assert-Equal ".\KillItWithFire.ps1 -ProductCode '{DDC95F26-92B1-4546-9678-5DC68DF76BA0}' -Level 3 -Force" $s.command 'equivalent command line'
         Assert-Equal $true ($s.userDataText -like '*1 item(s), 1.0 MB*') 'user data box shows what it would add'
         Assert-Equal $true ([bool]$s.cleanEnabled) 'Clean up enabled once a plan is loaded'
+        Assert-Equal $false ([bool]$s.cleanEnabledWhileBusy) 'mid-run, ticking an option leaves Clean up off (no second run of the same plan)'
         Assert-Equal '' $s.policyLabel 'no policy label'
         Assert-Equal 'False|&Clean up|True' "$($s.killItChecked)|$($s.cleanText)|$($s.killItEnabled)" 'KILL IT starts unticked: the proper way is the default'
         Assert-Equal $true ($null -ne $s.killIt) 'the KILL IT wiring was exercised'

@@ -4854,7 +4854,7 @@ function New-KillItWithFireForm {
             try { Add-Content -LiteralPath $log -Value ("{0}  {1}`r`n{2}`r`n{3}`r`n" -f (Get-Date -Format s), $e.Exception.Message, $pos, $e.Exception.StackTrace) } catch { }
             [void][System.Windows.Forms.MessageBox]::Show("Something went wrong in the window: $($e.Exception.Message)`n`nDetails: $log", 'Kill It With Fire', 'OK', 'Error')
         })
-    $ui = @{ Plan = $null; PlanFile = $null; App = $null; Unchecked = @{}; Loading = $false; Policy = $Policy }
+    $ui = @{ Plan = $null; PlanFile = $null; App = $null; Unchecked = @{}; Loading = $false; Policy = $Policy; Busy = $false }
     $bold = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
     $f = New-Object System.Windows.Forms.Form
     $f.Text = 'Kill It With Fire - remove an app completely'
@@ -4986,7 +4986,9 @@ function New-KillItWithFireForm {
             -NoBackup (-not $ui.Backup.Checked) -NoLog (-not $ui.LogCheck.Checked) -LogPath $ui.LogPath.Text -SkipUninstall $ui.KillIt.Checked
         $ui.Clean.Text = $(if ($ui.KillIt.Checked) { '&Kill it' } else { '&Clean up' })
         $ui.LogPath.Enabled = $ui.LogCheck.Checked -and -not $ui.Policy.LogPath
-        $ui.Clean.Enabled = [bool]($ui.Plan -and $lvl -ge 1)
+        # Never while a run is going: ticking any option mid-run used to switch Clean up back on, and a
+        # second click started a second run of the same plan alongside the first (2026-10-05).
+        $ui.Clean.Enabled = [bool]($ui.Plan -and $lvl -ge 1 -and -not $ui.Busy)
     }
     $ui.Rebuild = {
         # The checklist for the current plan and level; the user's unticks survive a level change.
@@ -5095,6 +5097,13 @@ function Start-KillItWithFireChild {
     return [System.Diagnostics.Process]::Start($psi)
 }
 
+function Test-SameEntry {
+    # The same uninstall entry (one key in one hive). The window's selection, its list and its scan results
+    # all compare this way.
+    param($A, $B)
+    return [bool]($A -and $B -and $A.KeyPath -eq $B.KeyPath -and $A.Hive -eq $B.Hive)
+}
+
 function Update-AppList {
     # The window's app list, rebuilt on every filter keystroke and every header click. The selected app stays
     # selected (and keeps its scan): $Ui.Filling mutes the selection handler while the rows are swapped.
@@ -5116,7 +5125,7 @@ function Update-AppList {
         [void]$li.SubItems.Add((Format-AppSize (Get-Prop $e 'SizeKB')))
         $li.Tag = $e
         [void]$Ui.Apps.Items.Add($li)
-        if ($Ui.App -and $e.KeyPath -eq $Ui.App.KeyPath -and $e.Hive -eq $Ui.App.Hive) { $li.Selected = $true; $keep = $li }
+        if (Test-SameEntry $e $Ui.App) { $li.Selected = $true; $keep = $li }
     }
     for ($i = 0; $i -lt $Ui.Apps.Columns.Count; $i++) {
         $arrow = if ($i -ne $Ui.SortColumn) { '' } elseif ($Ui.SortDesc) { ' ' + [char]0x25BC } else { ' ' + [char]0x25B2 }
@@ -5152,7 +5161,7 @@ function Show-KillItWithFireGui {
     $ui.Apps.Add_SelectedIndexChanged({
             if ($ui.Filling -or -not $ui.Apps.SelectedItems.Count) { return }
             $picked = $ui.Apps.SelectedItems[0].Tag
-            if ($ui.App -and $picked.KeyPath -eq $ui.App.KeyPath -and $picked.Hive -eq $ui.App.Hive) { return }
+            if (Test-SameEntry $picked $ui.App) { return }
             $ui.App = $picked
             $ui.Plan = $null; $ui.PlanFile = $null
             & $ui.Rebuild
@@ -5162,17 +5171,21 @@ function Show-KillItWithFireGui {
     $ui.Close.Add_Click({ $ui.Form.Close() })
 
     $timer = New-Object System.Windows.Forms.Timer; $timer.Interval = 700
-    $state = @{ Proc = $null; Kind = $null; Dir = $null; Started = $null; Lines = $null; Read = $null; Err = $null; Last = '' }
+    $state = @{ Proc = $null; Kind = $null; Dir = $null; Started = $null; Lines = $null; Read = $null; Err = $null; Last = ''; ScanApp = $null }
     $finish = {
         $timer.Stop()
+        $ui.Busy = $false
         foreach ($b in @($ui.Scan, $ui.Restore)) { $b.Enabled = $true }
         $code = $state.Proc.ExitCode
         $output = $state.Lines.ToString()
         if ($state.Err -and $state.Err.IsCompleted -and $state.Err.Result) { $output += "`r`n" + $state.Err.Result }
         if ($state.Kind -eq 'Scan') {
             $pf = Join-Path $state.Dir 'plan.json'
-            if ($code -eq 0 -and (Test-Path -LiteralPath $pf)) { $ui.PlanFile = $pf; & $ui.LoadPlan (Get-Content -LiteralPath $pf -Raw -Encoding UTF8 | ConvertFrom-Json) }
-            else { $ui.Status.Text = "Scan stopped (exit $code)."; Show-TextDialog 'Kill It With Fire: scan' $output $ui.Form }
+            # Only for the app it scanned. Another app picked mid-scan used to receive this plan, and the command
+            # line then named the new app at the old one's level: copied into an RMM, it would hit the wrong app.
+            if (-not (Test-SameEntry $state.ScanApp $ui.App)) { $ui.Status.Text = "The scan of '$($state.ScanApp.DisplayName)' finished, but '$($ui.App.DisplayName)' is picked now. Press Scan."; & $ui.UpdateCommand }
+            elseif ($code -eq 0 -and (Test-Path -LiteralPath $pf)) { $ui.PlanFile = $pf; & $ui.LoadPlan (Get-Content -LiteralPath $pf -Raw -Encoding UTF8 | ConvertFrom-Json) }
+            else { $ui.Status.Text = "Scan stopped (exit $code)."; & $ui.UpdateCommand; Show-TextDialog 'Kill It With Fire: scan' $output $ui.Form }
         } else {
             # By kind: a restore's 3010 means "reboot and it's in effect" and its 1 means "not finished, run
             # Restore again"; only a cleanup's 3010 goes on to Resume (review 2026-09-29).
@@ -5183,7 +5196,9 @@ function Show-KillItWithFireGui {
             }
             $ui.Status.Text = "$($state.Kind) finished: exit $code ($meaning)."
             Show-TextDialog "Kill It With Fire: $($state.Kind) (exit $code, $meaning)" $output $ui.Form
-            if ($state.Kind -ne 'Restore') { $ui.Plan = $null; $ui.PlanFile = $null; & $ui.Rebuild }
+            # After a restore too: it changed the machine, so a scan from before it no longer describes it.
+            # (It also left Clean up greyed out with that plan still loaded until something else redrew it.)
+            $ui.Plan = $null; $ui.PlanFile = $null; & $ui.Rebuild
         }
     }
     $timer.Add_Tick({
@@ -5223,7 +5238,8 @@ function Show-KillItWithFireGui {
     $launch = {
         param([string] $Kind, [string[]] $ArgList)
         $state.Kind = $Kind; $state.Dir = Join-Path $work ([guid]::NewGuid().ToString('N').Substring(0, 8)); [void](New-Item -ItemType Directory -Force -Path $state.Dir)
-        $state.Started = Get-Date; $state.Last = ''
+        $state.Started = Get-Date; $state.Last = ''; $state.ScanApp = $ui.App
+        $ui.Busy = $true
         foreach ($b in @($ui.Scan, $ui.Restore, $ui.Clean)) { $b.Enabled = $false }
         $state.Proc = Start-KillItWithFireChild -Arguments ($ArgList + @('-OutDir', $state.Dir))
         $state.Lines = New-Object System.Text.StringBuilder
@@ -5346,7 +5362,16 @@ function Invoke-GuiSelfTest {
         categories = @($ui.Categories.Items | ForEach-Object { [string]$_ }); categoriesEnabled = $ui.Categories.Enabled; description = $ui.Description.Text
         command = $ui.Command.Text; cleanEnabled = $ui.Clean.Enabled; killItEnabled = $ui.KillIt.Enabled; killIt = $null
         levelAfterScan = $levelAfterScan; title = $ui.Form.Text; hasIcon = ($null -ne $script:WindowIcon -and [object]::ReferenceEquals($ui.Form.Icon, $script:WindowIcon)); appColumns = @($ui.Apps.Columns | ForEach-Object { $_.Text })
+        cleanEnabledWhileBusy = $null
     }
+    # Mid-run, ticking an option must leave Clean up off (it switched it back on: a second run of the same plan).
+    $ui.Busy = $true
+    $ui.Review.Checked = -not $ui.Review.Checked
+    [System.Windows.Forms.Application]::DoEvents()
+    $stateOut.cleanEnabledWhileBusy = $ui.Clean.Enabled
+    $ui.Review.Checked = -not $ui.Review.Checked
+    $ui.Busy = $false
+    & $ui.UpdateCommand
     # The KILL IT wiring: from Scan only, ticking it must jump to Full scrub, say -KillIt, and relabel the
     # button; dropping back to level 1 must untick it (there is nothing to kill there).
     if ($ui.Plan -and $ui.KillIt.Enabled) {
