@@ -364,6 +364,9 @@ Update-AppList $lui $fx
 Assert-Equal 'alpha' ((@($lv.Items) | Where-Object { $_.Selected } | ForEach-Object { $_.Text }) -join ',') 'window list: re-sorting keeps the selected app selected'
 Assert-Equal $false $lui.Filling 'window list: the selection handler is live again afterwards'
 $lv.Dispose()
+Assert-Equal 'dotPDN LLC' (Select-SignerOrg @{ 'Microsoft Corporation' = 3; 'dotPDN LLC' = 1 }) 'signer: a third-party app bundling Microsoft-signed runtime files is still its vendor''s (paint.net)'
+Assert-Equal 'Microsoft Corporation' (Select-SignerOrg @{ 'Microsoft Corporation' = 2 }) 'signer: all Microsoft-signed is Microsoft (the refusal still holds)'
+Assert-Equal $null (Select-SignerOrg @{}) 'signer: nothing signed, no signer'
 Assert-Equal 'C:\a' (Get-ParentPath 'C:\a\b') 'parent path'
 Assert-Equal 'C:\' (Get-ParentPath 'C:\a') 'parent of a top folder is the drive'
 Assert-Equal $null (Get-ParentPath 'C:\') 'the drive has no parent'

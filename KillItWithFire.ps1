@@ -634,6 +634,18 @@ $script:SecurityVendors = [ordered]@{
     'Elastic'      = 'elastic-agent uninstall'
 }
 
+function Select-SignerOrg {
+    # The app's signer, from @{ org = how many of its executables it signed }: the most frequent NON-Microsoft
+    # signer, and Microsoft only when nothing else signed any of them. A third-party app can BUNDLE
+    # Microsoft-signed files: paint.net ships the .NET runtime, its Microsoft-signed helpers outnumbered dotPDN's
+    # own exe, and the app was refused as "a Microsoft component" (lab rerun, 2026-10-05).
+    param([hashtable] $OrgCounts)
+    if (-not $OrgCounts -or -not $OrgCounts.Count) { return $null }
+    $others = @($OrgCounts.GetEnumerator() | Where-Object { -not (Test-IsMicrosoftName $_.Key) } | Sort-Object Value -Descending)
+    if ($others.Count) { return $others[0].Key }
+    return ($OrgCounts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1).Key
+}
+
 function Get-RefusalReason {
     # Protected products are refused at PLAN time, re-checked once the real publisher and signer are
     # known: a -ProductCode run with no uninstall entry starts with an empty publisher (review 2026-09-26).
@@ -1867,7 +1879,7 @@ function New-KillItWithFirePlan {
         $org = Get-SignerOrg (Get-SignerSubject $f)
         if ($org) { $signerFiles += "$f ($org)"; if ($orgCounts.ContainsKey($org)) { $orgCounts[$org]++ } else { $orgCounts[$org] = 1 } }
     }
-    if ($orgCounts.Count) { $signerOrg = ($orgCounts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1).Key }
+    $signerOrg = Select-SignerOrg $orgCounts
     if (-not $refusal) { $refusal = Get-RefusalReason $publisher $targetName $signerOrg }
     $samePublisherOthers = @($entries | Where-Object { $_.Publisher -and $publisher -and $_.Publisher.Equals($publisher, [StringComparison]::OrdinalIgnoreCase) -and $matched -notcontains $_ -and ($_.ProductCode -ne $pc -or -not $pc) } | ForEach-Object { $_.DisplayName } | Select-Object -Unique)
 
