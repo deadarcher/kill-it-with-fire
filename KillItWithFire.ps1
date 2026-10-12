@@ -2199,6 +2199,9 @@ function New-KillItWithFirePlan {
     $ourClsids = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $ourClassKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $appIdUse = @{}
+    # The compiled pre-check's needles (KillItWithFire.Fast.MayReference): the app's folders and its own files'
+    # names. Both are final by now (OurFiles from the MSI, MatchRoots above).
+    $refNeedles = [string[]]@(@($script:MatchRoots) + @($script:OurFiles | ForEach-Object { try { [System.IO.Path]::GetFileName($_) } catch { $_ } }) | Where-Object { $_ } | Select-Object -Unique)
     $comSources = @(@{ Hive = 'HKLM64'; Path = 'SOFTWARE\Classes'; Scope = 'machine' }, @{ Hive = 'HKLM32'; Path = 'SOFTWARE\Classes'; Scope = 'machine (32-bit)' })
     foreach ($sid in $loadedSids) { $comSources += @{ Hive = 'HKU'; Path = "$($sid)_Classes"; Scope = "user:$sid" } }
     $pendingAppIds = @()
@@ -2208,9 +2211,12 @@ function New-KillItWithFirePlan {
         # of a 137-second Epic Games Launcher scan (2026-10-04). The test on each value is unchanged.
         $classes = [KillItWithFire.Fast]::ReadComClasses($clsidRoot)
         for ($unr = 0; $unr -lt $classes.Unreadable; $unr++) { Add-Unreadable 'COM classes' }
+        [KillItWithFire.Fast]::MarkComCandidates($classes, $refNeedles)
         foreach ($ci in $classes.Items) {
             $clsid = $ci.Clsid
             $appIdOfClass = [string]$ci.AppId
+            # None of its servers can name the app (compiled pre-check): not ours, and its AppID is someone's.
+            if (-not $ci.MayBeOurs) { if ($appIdOfClass) { $appIdUse["$($src.Hive)|$appIdOfClass"] = $true }; continue }
             $isOurs = $false
             foreach ($server in @('InprocServer32', 'LocalServer32', 'InprocHandler32')) {
                 $val = [string]$ci.$server
@@ -2278,26 +2284,20 @@ function New-KillItWithFirePlan {
         'CompressedFolder', 'SystemFileAssociations', 'Msi.Package', 'Msi.Patch', 'Microsoft.PowerShellScript.1', 'Python.File')
     foreach ($src in @($comSources | Where-Object { $_.Hive -ne 'HKLM32' })) {
         $cr = Open-Key $src.Hive $src.Path 'file associations'
-        $assocKeys = @()
-        foreach ($n in (Get-SubKeyNamesSafe $cr 'file associations')) {
-            if ($n.StartsWith('.') -or $n -in @('CLSID', 'TypeLib', 'Interface', 'AppID', 'Installer', 'WOW6432Node', 'Wow6432Node', 'Applications', 'MIME', 'Local Settings')) { continue }
-            $assocKeys += $n
-        }
-        $apps = $null; try { $apps = $cr.OpenSubKey('Applications', $false) } catch { }
-        foreach ($n in (Get-SubKeyNamesSafe $apps)) { $assocKeys += "Applications\$n" }
-        Close-Key $apps
-        foreach ($n in $assocKeys) {
-            if ($ourClassKeys.Contains($n)) { continue }
-            $ak = $null; try { $ak = $cr.OpenSubKey($n, $false) } catch { continue }
-            if ($null -eq $ak) { continue }
+        # The key walk is compiled (KillItWithFire.Fast), like COM's: ~3,700 class keys opened from PowerShell were
+        # 5 s of every scan (lab 2026-10-12). Same keys in the same order; the test on each value is unchanged.
+        $assoc = [KillItWithFire.Fast]::ReadShellAssociations($cr, [string[]]@('CLSID', 'TypeLib', 'Interface', 'AppID', 'Installer', 'WOW6432Node', 'Wow6432Node', 'Applications', 'MIME', 'Local Settings'), $refNeedles)
+        for ($unr = 0; $unr -lt $assoc.Unreadable; $unr++) { Add-Unreadable 'file associations' }
+        for ($unr = 0; $unr -lt $assoc.AppsUnreadable; $unr++) { Add-Unreadable 'registry' }
+        foreach ($ai in $assoc.Items) {
+            $n = $ai.Name
+            if (-not $ai.MayBeOurs -or $ourClassKeys.Contains($n)) { continue }
             $why = $null
-            foreach ($sub in @('shell\open\command', 'DefaultIcon')) {
-                $sk = $null; try { $sk = $ak.OpenSubKey($sub, $false) } catch { }
-                $val = [string](Get-ValueSafe $sk ''); Close-Key $sk
-                if ($val -and (Test-OurReference $val)) { $why = "$sub = $val"; break }
+            foreach ($pair in @(@('shell\open\command', $ai.OpenCommand), @('DefaultIcon', $ai.DefaultIcon))) {
+                $val = [string]$pair[1]
+                if ($val -and (Test-OurReference $val)) { $why = "$($pair[0]) = $val"; break }
             }
-            $friendly = [string](Get-ValueSafe $ak 'FriendlyTypeName')
-            Close-Key $ak
+            $friendly = [string]$ai.FriendlyTypeName
             if ($why) {
                 # A Windows ProgID the app took over (txtfile, http...) is REPAIRED, never deleted, and it is
                 # NOT ours: counting it as ours would let the extension sweep below unhook .txt itself.
@@ -3451,7 +3451,60 @@ static string DefaultOf(RegistryKey parent, string sub) {
     if (k == null) { return null; }
     using (k) { try { return AsText(k.GetValue("", null)); } catch { return null; } }
 }
-public sealed class ComClassInfo { public string Clsid; public string AppId; public string InprocServer32; public string LocalServer32; public string InprocHandler32; public string ProgId; public string VersionIndependentProgId; }
+// Can this text point at the app at all? Test-OurReference only ever matches a text that, with its environment
+// variables expanded, contains one of the app's folders, or names one of the app's own files, whose file name it
+// must then contain. A text with none of those substrings is never ours, so the PowerShell test is skipped for
+// it, and only for it: this can rule a text out, never in (2026-10-12: the PowerShell test on all ~7,000 COM
+// classes and ~3,700 class keys was ~8 s of every scan).
+public static bool MayReference(string text, string[] needles) {
+    if (string.IsNullOrEmpty(text) || needles == null || needles.Length == 0) { return false; }
+    string e1 = Environment.ExpandEnvironmentVariables(text);
+    string e2 = Environment.ExpandEnvironmentVariables(e1);   // the path is normalized (expanded) once more
+    foreach (string n in needles) {
+        if (string.IsNullOrEmpty(n)) { continue; }
+        if (e1.IndexOf(n, StringComparison.OrdinalIgnoreCase) >= 0 || e2.IndexOf(n, StringComparison.OrdinalIgnoreCase) >= 0) { return true; }
+    }
+    return false;
+}
+public sealed class ComClassInfo { public string Clsid; public string AppId; public string InprocServer32; public string LocalServer32; public string InprocHandler32; public string ProgId; public string VersionIndependentProgId; public bool MayBeOurs; }
+public static void MarkComCandidates(ComClassList list, string[] needles) {
+    foreach (ComClassInfo ci in list.Items) {
+        ci.MayBeOurs = MayReference(ci.InprocServer32, needles) || MayReference(ci.LocalServer32, needles) || MayReference(ci.InprocHandler32, needles);
+    }
+}
+public sealed class AssocInfo { public string Name; public string OpenCommand; public string DefaultIcon; public string FriendlyTypeName; public bool MayBeOurs; }
+public sealed class AssocList { public List<AssocInfo> Items = new List<AssocInfo>(); public int Unreadable; public int AppsUnreadable; }
+// Every class key that is not an extension or a structural key (skip, case-insensitive like PowerShell's -in),
+// then every Applications\<exe>, in that order: the default values of shell\open\command and DefaultIcon, and
+// FriendlyTypeName. The walk the scan did from PowerShell (5 s for ~3,700 keys, lab 2026-10-12).
+public static AssocList ReadShellAssociations(RegistryKey classesRoot, string[] skip, string[] needles) {
+    var list = new AssocList();
+    if (classesRoot == null) { return list; }
+    var skipSet = new HashSet<string>(skip ?? new string[0], StringComparer.OrdinalIgnoreCase);
+    string[] names;
+    try { names = classesRoot.GetSubKeyNames(); } catch { list.Unreadable++; return list; }
+    var keys = new List<string>();
+    foreach (string n in names) { if (n.StartsWith(".", StringComparison.Ordinal) || skipSet.Contains(n)) { continue; } keys.Add(n); }
+    RegistryKey apps = null;
+    try { apps = classesRoot.OpenSubKey("Applications", false); } catch { }
+    if (apps != null) {
+        using (apps) { try { foreach (string n in apps.GetSubKeyNames()) { keys.Add("Applications\\" + n); } } catch { list.AppsUnreadable++; } }
+    }
+    foreach (string n in keys) {
+        RegistryKey ak = null;
+        try { ak = classesRoot.OpenSubKey(n, false); } catch { continue; }
+        if (ak == null) { continue; }
+        using (ak) {
+            var info = new AssocInfo { Name = n };
+            info.OpenCommand = DefaultOf(ak, "shell\\open\\command");
+            info.DefaultIcon = DefaultOf(ak, "DefaultIcon");
+            try { info.FriendlyTypeName = AsText(ak.GetValue("FriendlyTypeName", null)); } catch { }
+            info.MayBeOurs = MayReference(info.OpenCommand, needles) || MayReference(info.DefaultIcon, needles);
+            list.Items.Add(info);
+        }
+    }
+    return list;
+}
 public sealed class ComClassList { public List<ComClassInfo> Items = new List<ComClassInfo>(); public int Unreadable; }
 // Every class under a CLSID key: its AppID and the default values of its server and ProgID subkeys.
 public static ComClassList ReadComClasses(RegistryKey clsidRoot) {
