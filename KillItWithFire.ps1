@@ -261,6 +261,14 @@ function Get-Prop {
     return $null
 }
 
+function Format-NameVersion {
+    # "Name version", without saying the version twice: plenty of apps put it in their DisplayName already
+    # ("Greenshot 1.3.315" + "1.3.315" read "Greenshot 1.3.315 1.3.315" in the window, lab 2026-10-12).
+    param([string] $Name, [string] $Version)
+    if (-not $Version -or $Name.IndexOf($Version, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $Name }
+    return "$Name $Version"
+}
+
 function ConvertTo-UtcDate {
     # Our timestamps are ISO 8601 text; PowerShell 7's ConvertFrom-Json turns them into DateTime first.
     param($Value)
@@ -1203,6 +1211,19 @@ function Get-AppSortKey {
     return [string](Get-Prop $Entry 'DisplayName')
 }
 
+function Test-SearchMatch {
+    # The window's search: a plain substring, or the same with spaces, hyphens, dots and underscores ignored
+    # on both sides. "power bi" found nothing on the lab VM: Power BI's visible entry is "Microsoft PowerBI
+    # Desktop (x64)" (the spaced one is a system component), and "7zip" missed "7-Zip" (2026-10-12).
+    param([string] $Text, [string] $Filter)
+    if (-not $Filter) { return $true }
+    if (-not $Text) { return $false }
+    if ($Text.IndexOf($Filter, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
+    $f = $Filter -replace '[\s\-_.]', ''
+    if (-not $f) { return $false }
+    return (($Text -replace '[\s\-_.]', '').IndexOf($f, [StringComparison]::OrdinalIgnoreCase) -ge 0)
+}
+
 function Select-AppListRows {
     # The window's app list: the search text filters on name or publisher, then one column sorts it. Dates
     # and sizes sort as dates and numbers, versions part by part, and an empty cell always goes last.
@@ -1211,7 +1232,7 @@ function Select-AppListRows {
     foreach ($e in $Entries) {
         if ($null -eq $e) { continue }
         $name = [string](Get-Prop $e 'DisplayName')
-        if ($Filter -and $name.IndexOf($Filter, [StringComparison]::OrdinalIgnoreCase) -lt 0 -and ([string](Get-Prop $e 'Publisher')).IndexOf($Filter, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+        if ($Filter -and -not (Test-SearchMatch $name $Filter) -and -not (Test-SearchMatch ([string](Get-Prop $e 'Publisher')) $Filter)) { continue }
         $k = Get-AppSortKey $e $Column
         $keyed.Add([pscustomobject]@{ Entry = $e; Key = $k; Name = $name; Empty = ($null -eq $k -or "$k" -eq '') })
     }
@@ -1302,17 +1323,25 @@ function Get-ShortPathSafe {
     return $null
 }
 
+$script:VendorCache = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
 function Get-VendorOfFile {
     # CompanyName from the file's version resource. Kernel drivers are signed by Microsoft's attestation
     # service on Windows 10+, so their SIGNATURE can't tie them to a vendor; the vendor's own version
     # resource can. Self-declared, so it is weak evidence: always "needs review".
+    # Remembered per file: the services pass asks for ~700 of them and the driver pass asks again.
     param([string] $File)
+    if (-not $File) { return $null }
+    $hit = $null
+    if ($script:VendorCache.TryGetValue($File, [ref]$hit)) { return $hit }
+    $res = $null
     try {
-        if (-not $File -or -not (Test-Path -LiteralPath $File -PathType Leaf)) { return $null }
-        $c = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($File).CompanyName
-        if ($c) { return $c.Trim() }
+        if (Test-Path -LiteralPath $File -PathType Leaf) {
+            $c = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($File).CompanyName
+            if ($c) { $res = $c.Trim() }
+        }
     } catch { }
-    return $null
+    $script:VendorCache[$File] = $res
+    return $res
 }
 
 $script:MatchRoots = @()
@@ -1951,6 +1980,19 @@ function New-KillItWithFirePlan {
     }
     Close-Key $svcRoot
     $otherProductPaths = @($otherEntries | ForEach-Object { Get-EntryPaths $_ } | Where-Object { $_ } | Select-Object -Unique)
+    # Normalized once and compared in a plain loop (Test-PathUnder's rule, inlined). Piping each of ~700
+    # services' files through Test-PathUnder against every other product's paths was most of a 19 s services
+    # pass for Greenshot (lab 2026-10-12).
+    $otherRoots = @($otherProductPaths | ForEach-Object { Get-NormalizedPath $_ } | Where-Object { $_ } | Select-Object -Unique)
+    $underOtherProduct = {
+        param([string] $File)
+        $f = Get-NormalizedPath $File
+        if (-not $f) { return $false }
+        foreach ($r in $otherRoots) {
+            if ($f.Equals($r, [StringComparison]::OrdinalIgnoreCase) -or $f.StartsWith($r.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { return $true }
+        }
+        return $false
+    }
     $vendorNames = @(@($signerOrg, $publisher) | Where-Object { $_ -and -not (Test-IsMicrosoftName $_) })
     $ourServices = @()
     foreach ($s in $services) {
@@ -1966,8 +2008,9 @@ function New-KillItWithFirePlan {
             # nothing else installed: Citrix SSON "claimed" eight drivers of the Citrix products next to it.
             $file = if ($s.ServiceDll) { $s.ServiceDll } else { $s.Image }
             $isDriver = [bool]($s.Type -band 0xB)
-            if ($file -and -not (@($otherProductPaths | Where-Object { Test-PathUnder $file $_ }).Count) -and
-                -not ($isDriver -and $s.Start -eq 0) -and -not $deviceBound.Contains($s.Name)) {
+            # The free tests first: all of them must hold, so the order changes only the time.
+            if ($file -and -not ($isDriver -and $s.Start -eq 0) -and -not $deviceBound.Contains($s.Name) -and
+                -not (& $underOtherProduct $file)) {
                 $company = Get-VendorOfFile $file
                 if ($company -and -not (Test-IsMicrosoftName $company)) {
                     foreach ($v in $vendorNames) {
@@ -3113,7 +3156,7 @@ function Format-Report {
     & $line "Kill It With Fire $($Plan.version) - $(if ($Result) { "level $($Result.level) run" } else { 'scan (dry run: NOTHING was changed)' })"
     & $line "Computer: $($Plan.computer)    Run: $($Plan.runId)"
     & $line ''
-    & $line "Target:    $($t.displayName) $($t.version)"
+    & $line "Target:    $(Format-NameVersion $t.displayName $t.version)"
     & $line "Publisher: $($t.publisher)"
     if ($t.productCode) { & $line "MSI:       ProductCode $($t.productCode)   UpgradeCode $(if ($t.upgradeCode) { $t.upgradeCode } else { '(none found)' })" }
     if ($t.cachedMsi) { & $line "Cached MSI: $($t.cachedMsi) $(if ($t.cachedMsiPresent) { '(present)' } else { '(MISSING)' })" }
@@ -4881,7 +4924,7 @@ function Format-SelectedApp {
         $isMsi = [bool](Get-Prop $Target 'isMsi'); $scope = $null
     } else { return '' }
     $about = @(@($pub, $(if ($isMsi) { 'MSI' } else { 'EXE' }), $scope) | Where-Object { $_ })
-    return ('{0}{1}   ({2})' -f $name, $(if ($ver) { " $ver" } else { '' }), ($about -join ', '))
+    return ('{0}   ({1})' -f (Format-NameVersion $name $ver), ($about -join ', '))
 }
 
 function New-KillItWithFireForm {
@@ -5071,7 +5114,7 @@ function New-KillItWithFireForm {
         $act = & $ui.GetAction; $lvl = & $ui.GetLevel
         $scanned = [bool]($ui.Plan -and -not (Get-Prop $ui.Plan 'refused'))
         foreach ($rb in $ui.Actions) { $rb.Enabled = ($scanned -and (& $ui.ActionAllowed ([int]$rb.Tag))) }
-        $ui.ActionText.Text = $script:ActionDescriptions[$(if ($scanned) { $act } else { 0 })]
+        $ui.ActionText.Text = if ($ui.Plan -and -not $scanned) { 'Nothing to choose: the scan refused this app (step 2 says why).' } else { $script:ActionDescriptions[$(if ($scanned) { $act } else { 0 })] }
         $ui.Loading = $true
         $ui.Categories.BeginUpdate(); $ui.Categories.Items.Clear()
         foreach ($row in @(Get-GuiGroups $ui.Plan $lvl)) {
@@ -5115,7 +5158,9 @@ function New-KillItWithFireForm {
         $found = @($PlanObject.items).Count
         $notes = @(Get-Prop $PlanObject 'warnings' | Where-Object { $_ }).Count
         & $ui.ShowSelected (Format-SelectedApp $ui.App $PlanObject.target)
-        $ui.Status.Text = "Scanned '$($PlanObject.target.displayName)': $found item(s)$(if ($notes) { ", $notes note(s)" }). Nothing changed yet."
+        $ui.Status.Text = if ($refused) { "Refused '$($PlanObject.target.displayName)'. Nothing changed." } else { "Scanned '$($PlanObject.target.displayName)': $found item(s)$(if ($notes) { ", $notes note(s)" }). Nothing changed yet." }
+        # The line is one row high and a refusal reason is a paragraph: the whole of it rides in the tooltip.
+        $ui.Tip.SetToolTip($ui.ScanText, $(if ($refused) { "Refused: $refused" } else { '' }))
         $ui.ScanText.Text = if ($refused) { "Refused: $refused" } else { "Scanned: $found item(s)$(if ($notes) { ", $notes note(s) (View items)" }). Nothing changed yet. Now choose what to clean, below." }
     }
     $ui.ClearPlan = {
@@ -5221,6 +5266,18 @@ function Update-AppList {
     }
     $Ui.Apps.EndUpdate()
     $Ui.Filling = $false
+    # The picked app filtered OUT of the list is no longer picked. It used to stay picked, invisible, with Scan
+    # live: type another app's name, see two rows, press Enter, and the HIDDEN app was scanned - one more
+    # click from Clean up on an app nobody could see (lab 2026-10-12: Power BI stayed "Selected" under a
+    # search for Visual Studio Code).
+    # Not mid-run: the run's finish compares against the picked app (Scan and Clean up are off meanwhile anyway).
+    if ($Ui.App -and -not $keep -and -not $Ui.Busy) {
+        $Ui.App = $null
+        & $Ui.ShowSelected ''
+        & $Ui.ClearPlan
+        $Ui.ScanText.Text = 'Scanning changes nothing: it lists what would go, and why.'
+        $Ui.Status.Text = 'Pick an app and press Scan. Scanning changes nothing.'
+    }
     if ($keep) { $keep.EnsureVisible() }
     # One app left after filtering: select it, so typing its name and pressing Alt+S scans it.
     elseif ($Ui.Apps.Items.Count -eq 1) { $Ui.Apps.Items[0].Selected = $true }
@@ -5287,6 +5344,14 @@ function Show-KillItWithFireGui {
                 & $ui.UpdateCommand
             }
             elseif ($code -eq 0 -and (Test-Path -LiteralPath $pf)) { $ui.PlanFile = $pf; & $ui.LoadPlan (Get-Content -LiteralPath $pf -Raw -Encoding UTF8 | ConvertFrom-Json) }
+            # A refusal (exit 2, e.g. a Microsoft product) still writes its plan, carrying the reason. Loaded, step 2
+            # says "Refused: <why>" and step 3 stays shut. It used to land below as "The scan stopped (exit 2).
+            # Press Scan to try again", which no number of scans could fix (lab 2026-10-12, PowerToys).
+            elseif ($code -eq 2 -and (Test-Path -LiteralPath $pf) -and ($refusedPlan = Get-Content -LiteralPath $pf -Raw -Encoding UTF8 | ConvertFrom-Json) -and (Get-Prop $refusedPlan 'refused')) {
+                # A refused plan stops before discovery: no items, no warnings. Strict mode throws on a missing property.
+                foreach ($p in @('items', 'warnings')) { if ($null -eq $refusedPlan.PSObject.Properties[$p]) { $refusedPlan | Add-Member -NotePropertyName $p -NotePropertyValue @() } }
+                $ui.PlanFile = $null; & $ui.LoadPlan $refusedPlan
+            }
             else { $ui.Status.Text = "Scan stopped (exit $code)."; $ui.ScanText.Text = "The scan stopped (exit $code). Press Scan to try again."; & $ui.UpdateCommand; Show-TextDialog 'Kill It With Fire: scan' $output $ui.Form }
         } else {
             # By kind: a restore's 3010 means "reboot and it's in effect" and its 1 means "not finished, run
@@ -5361,14 +5426,19 @@ function Show-KillItWithFireGui {
             $g = if ($ui.Categories.SelectedIndex -ge 0) { ([string]$ui.Categories.SelectedItem -split ' ')[0] } else { $null }
             $dlg = New-Object System.Windows.Forms.Form; $dlg.Text = $(if ($g) { "Items: $g" } else { 'All items' }); $dlg.ClientSize = New-Object System.Drawing.Size(1000, 520); $dlg.StartPosition = 'CenterParent'; $dlg.Font = $ui.Form.Font; $dlg.Icon = $ui.Form.Icon
             $lv = New-Object System.Windows.Forms.ListView; $lv.Dock = 'Fill'; $lv.View = 'Details'; $lv.FullRowSelect = $true
-            foreach ($c in @(@('Level', 44), @('Risk', 110), @('Target', 390), @('Action', 220), @('Why', 300))) { [void]$lv.Columns.Add($c[0], $c[1]) }
-            # The scan's notes first: the window showed none of them until 2026-10-04 (only the command line's
-            # report did), including "this folder also holds other programs".
-            foreach ($w in @(Get-Prop $ui.Plan 'warnings' | Where-Object { $_ })) {
-                $li = New-Object System.Windows.Forms.ListViewItem('!')
-                [void]$li.SubItems.Add('note'); [void]$li.SubItems.Add([string]$w); [void]$li.SubItems.Add(''); [void]$li.SubItems.Add('')
-                $li.ToolTipText = [string]$w
-                [void]$lv.Items.Add($li)
+            # Columns sum to the dialog's width: they were 64 px wider, so Why always ran off the right edge.
+            foreach ($c in @(@('Level', 44), @('Risk', 110), @('Target', 360), @('Action', 190), @('Why', 270))) { [void]$lv.Columns.Add($c[0], $c[1]) }
+            # The scan's notes, in full, above the items. They used to be rows of their own (since 2026-10-04,
+            # when the window showed none of them), but a note is a sentence and the Target column cut it at
+            # 60-odd characters: "3 signed-out profile(s) are NOT cleaned (their registry hives are never l..."
+            # (lab 2026-10-12). A note that matters must be readable without hovering.
+            $notes = @(Get-Prop $ui.Plan 'warnings' | Where-Object { $_ })
+            if ($notes.Count) {
+                $nb = New-Object System.Windows.Forms.TextBox; $nb.Multiline = $true; $nb.ReadOnly = $true; $nb.Dock = 'Top'; $nb.ScrollBars = 'Vertical'
+                $nb.BackColor = [System.Drawing.SystemColors]::Info; $nb.TabStop = $false
+                $nb.Text = 'The scan noted:' + "`r`n" + (($notes | ForEach-Object { '- ' + $_ }) -join "`r`n")
+                $nb.Height = [Math]::Min(150, 22 + 34 * $notes.Count)
+                $dlg.Controls.Add($nb)
             }
             $lv.ShowItemToolTips = $true
             foreach ($i in @($ui.Plan.items | Where-Object { -not $g -or $_.group -eq $g })) {
@@ -5377,7 +5447,8 @@ function Show-KillItWithFireGui {
                 [void]$li.SubItems.Add([string]$i.target); [void]$li.SubItems.Add([string]$i.action); [void]$li.SubItems.Add([string]$i.evidence)
                 [void]$lv.Items.Add($li)
             }
-            $dlg.Controls.Add($lv); [void]$dlg.ShowDialog($ui.Form); $dlg.Dispose()
+            $dlg.Controls.Add($lv); $lv.BringToFront()   # docked last, so it fills what the notes box leaves
+            [void]$dlg.ShowDialog($ui.Form); $dlg.Dispose()
         })
     $ui.Clean.Add_Click({
             $act = & $ui.GetAction; $lvl = & $ui.GetLevel

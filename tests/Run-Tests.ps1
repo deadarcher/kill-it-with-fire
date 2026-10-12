@@ -23,6 +23,20 @@ foreach ($g in @('{00000000-0000-0000-0000-000000000000}', '{FFFFFFFF-1234-ABCD-
 Assert-Equal '{AC76BA86-7AD7-1033-7B44-AC0F074E4100}' (ConvertFrom-PackedGuid (ConvertTo-PackedGuid 'ac76ba86-7ad7-1033-7b44-ac0f074e4100')) 'lowercase, no braces'
 Assert-Equal $null (ConvertFrom-PackedGuid 'not-a-guid') 'unpack garbage = null'
 
+# ---- name + version, said once
+Assert-Equal 'Greenshot 1.3.315' (Format-NameVersion 'Greenshot 1.3.315' '1.3.315') 'version already in the name is not repeated'
+Assert-Equal 'KeePassXC 2.7.12' (Format-NameVersion 'KeePassXC' '2.7.12') 'version appended when the name lacks it'
+Assert-Equal 'Bitwarden' (Format-NameVersion 'Bitwarden' '') 'no version'
+Assert-Equal 'IrfanView 4.76 (64-bit)' (Format-NameVersion 'IrfanView 4.76 (64-bit)' '4.76') 'version inside the name'
+
+# ---- the window's search
+Assert-Equal $true (Test-SearchMatch 'Microsoft PowerBI Desktop (x64)' 'power bi') 'space in the search, none in the name'
+Assert-Equal $true (Test-SearchMatch '7-Zip 26.02 (x64)' '7zip') 'hyphen in the name, none in the search'
+Assert-Equal $true (Test-SearchMatch 'Notepad++ (64-bit x64)' 'notepad++') 'plain substring still matches'
+Assert-Equal $false (Test-SearchMatch 'KeePassXC' 'keepass 2') 'a different app does not match'
+Assert-Equal $false (Test-SearchMatch '' 'zoom') 'empty publisher does not match'
+Assert-Equal $true (Test-SearchMatch 'Anything' '') 'empty search matches everything'
+
 # ---- paths
 Assert-Equal 'C:\Program Files\App' (Get-NormalizedPath 'C:\Program Files\App\') 'trailing slash dropped'
 Assert-Equal 'C:\x\y.exe' (Get-NormalizedPath '"C:\x\y.exe"') 'quotes dropped'
