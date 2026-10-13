@@ -23,6 +23,36 @@ foreach ($g in @('{00000000-0000-0000-0000-000000000000}', '{FFFFFFFF-1234-ABCD-
 Assert-Equal '{AC76BA86-7AD7-1033-7B44-AC0F074E4100}' (ConvertFrom-PackedGuid (ConvertTo-PackedGuid 'ac76ba86-7ad7-1033-7b44-ac0f074e4100')) 'lowercase, no braces'
 Assert-Equal $null (ConvertFrom-PackedGuid 'not-a-guid') 'unpack garbage = null'
 
+# ---- driver INFs: the services they install and the hardware IDs they match
+$infText = @'
+[Version]
+Signature = "$WINDOWS NT$"
+Class     = Net
+
+[Manufacturer]
+%Mfg% = Fortinet, NTamd64, NTx86
+
+[Fortinet.NTamd64]
+%DeviceDesc% = ftvnic.ndi, root\ftvnic_a ; the virtual adapter
+"Second model" = second.ndi, ROOT\FTVNIC_B, *ftvnic_compat
+
+[Fortinet.NTx86]
+%DeviceDesc% = ftvnic.ndi, root\ftvnic_x86
+
+[ftvnic.ndi.Services]
+AddService = %ServiceName%, 2, ftvnic.Service
+AddService = "ftaux",, aux.Service
+
+[Strings]
+Mfg         = "Fortinet"
+DeviceDesc  = "Fortinet Virtual Ethernet Adapter"
+ServiceName = "ft_vnic"
+'@
+$inf = Read-InfFacts $infText
+Assert-Equal 'ft_vnic,ftaux' ($inf.Services -join ',') 'INF services, %string% resolved and quotes dropped'
+Assert-Equal 'root\ftvnic_a,root\ftvnic_b,*ftvnic_compat,root\ftvnic_x86' ($inf.HardwareIds -join ',') 'INF hardware IDs from every decorated model section, lower-cased, comments dropped'
+Assert-Equal 0 @((Read-InfFacts "[Version]`r`nSignature=x").Services).Count 'INF with no services'
+
 # ---- name + version, said once
 Assert-Equal 'Greenshot 1.3.315' (Format-NameVersion 'Greenshot 1.3.315' '1.3.315') 'version already in the name is not repeated'
 Assert-Equal 'KeePassXC 2.7.12' (Format-NameVersion 'KeePassXC' '2.7.12') 'version appended when the name lacks it'

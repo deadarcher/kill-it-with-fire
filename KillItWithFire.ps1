@@ -675,7 +675,7 @@ function Get-RefusalReason {
 $script:Categories = [ordered]@{
     Registration = @('UninstallEntry', 'MsiProduct', 'MsiUpgradeCode', 'MsiComponentClient', 'MsiPatch', 'MsiFolderEntry', 'MsiDependency', 'MsiCachedPackage', 'UpdaterRegistration')
     LogonHooks   = @('PasswordProviderRestore', 'CredentialProviderFilter', 'CredentialProvider', 'Winlogon', 'LsaPackage', 'NetworkProvider', 'AppInitDll', 'IfeoDebugger', 'WinsockProvider')
-    Drivers      = @('DeviceClassFilter', 'DeviceInstanceFilter', 'NetworkComponent', 'DriverPackage', 'Driver')
+    Drivers      = @('DeviceClassFilter', 'DeviceInstanceFilter', 'NetworkComponent', 'SoftwareDevice', 'DriverPackage', 'Driver')
     Services     = @('Service', 'RunningProcess')
     Startup      = @('ScheduledTask', 'RunValue', 'ActiveSetup')
     ComShell     = @('ComClass', 'ComTypeLib', 'ComAppId', 'ComProgId', 'ShellExtension', 'ShellVerb', 'FileAssociation')
@@ -687,7 +687,7 @@ $script:Categories = [ordered]@{
 $script:CategoryLabels = [ordered]@{
     Registration = 'Registration (uninstall entry, Windows Installer)'
     LogonHooks   = 'Logon and network hooks'
-    Drivers      = 'Drivers, device filters, network components'
+    Drivers      = 'Drivers, device filters, network components, software devices'
     Services     = 'Services and running programs'
     Startup      = 'Scheduled tasks and startup entries'
     ComShell     = 'COM, shell extensions, file associations'
@@ -708,7 +708,7 @@ $script:Order = @{
     # User-mode services stop BEFORE the drivers they hold open, so a driver can unload without a reboot.
     # The app's own running programs stop after its services (a service can restart them) and before its
     # files move (a running updater held Notepad++'s folder in place, lab 2026-09-26).
-    DeviceClassFilter = 310; DeviceInstanceFilter = 311; Service = 315; RunningProcess = 316; NetworkComponent = 320; DriverPackage = 330
+    DeviceClassFilter = 310; DeviceInstanceFilter = 311; Service = 315; RunningProcess = 316; NetworkComponent = 320; SoftwareDevice = 325; DriverPackage = 330
     Driver = 340; ScheduledTask = 350; RunValue = 360; ActiveSetup = 362
     ComClass = 370; ComTypeLib = 371; ComAppId = 372; ComProgId = 374; ShellExtension = 375; ShellVerb = 376
     FileAssociation = 377; PrintMonitor = 396; FirewallRule = 399; Shortcut = 400
@@ -953,6 +953,84 @@ function Get-ValueSafe {
     param($Key, [string] $Name)
     if ($null -eq $Key) { return $null }
     try { return $Key.GetValue($Name, $null) } catch { return $null }
+}
+
+function Read-InfFacts {
+    # From an INF's text: the services it installs (AddService) and the hardware IDs its models match
+    # ([Manufacturer] -> model sections, every ID after the install section), with %strings% resolved. Pure: the
+    # unit tests feed it text.
+    param([string] $Text)
+    $strings = @{}
+    foreach ($sec in [regex]::Matches($Text, '(?ims)^\s*\[Strings(\.[0-9A-Za-z]+)?\][^\r\n]*\r?\n(.*?)(?=^\s*\[|\z)')) {
+        foreach ($l in [regex]::Matches($sec.Groups[2].Value, '(?m)^\s*([^=;\s]+)\s*=\s*"?([^"\r\n;]*)"?')) {
+            if (-not $strings.ContainsKey($l.Groups[1].Value)) { $strings[$l.Groups[1].Value] = $l.Groups[2].Value.Trim() }
+        }
+    }
+    $resolve = { param([string] $v) $v = $v.Trim().Trim('"').Trim(); if ($v -match '^%(.+)%$' -and $strings.ContainsKey($matches[1])) { $strings[$matches[1]] } else { $v } }
+    $services = @()
+    foreach ($m in [regex]::Matches($Text, '(?im)^\s*AddService\s*=\s*"?([^",\s]+)')) {
+        $s = & $resolve $m.Groups[1].Value
+        if ($s -and $services -notcontains $s) { $services += $s }
+    }
+    # [Manufacturer]  %Mfg% = Models, NTamd64, NTx86  ->  sections Models, Models.NTamd64, Models.NTx86
+    $modelSections = @()
+    $mfg = [regex]::Match($Text, '(?ims)^\s*\[Manufacturer\][^\r\n]*\r?\n(.*?)(?=^\s*\[|\z)')
+    if ($mfg.Success) {
+        foreach ($l in [regex]::Matches($mfg.Groups[1].Value, '(?m)^\s*[^;=\r\n][^=\r\n]*=\s*([^\r\n;]+)')) {
+            $parts = @($l.Groups[1].Value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            if ($parts.Count) { $modelSections += $parts[0]; foreach ($d in @($parts | Select-Object -Skip 1)) { $modelSections += "$($parts[0]).$d" } }
+        }
+    }
+    $hwids = @()
+    foreach ($ms in $modelSections) {
+        $sec = [regex]::Match($Text, '(?ims)^\s*\[' + [regex]::Escape($ms) + '\][^\r\n]*\r?\n(.*?)(?=^\s*\[|\z)')
+        if (-not $sec.Success) { continue }
+        foreach ($l in [regex]::Matches($sec.Groups[1].Value, '(?m)^\s*[^;=\r\n][^=\r\n]*=\s*([^\r\n;]+)')) {
+            foreach ($id in @($l.Groups[1].Value -split ',' | Select-Object -Skip 1)) {
+                $h = ([string](& $resolve $id)).ToLowerInvariant()
+                if ($h -and $hwids -notcontains $h) { $hwids += $h }
+            }
+        }
+    }
+    return [pscustomobject]@{ Services = $services; HardwareIds = $hwids }
+}
+
+function Get-FileSha256 {
+    param([string] $Path)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { return [BitConverter]::ToString($sha.ComputeHash([System.IO.File]::ReadAllBytes($Path))).Replace('-', '') } finally { $sha.Dispose() }
+}
+
+function Get-AppInfFacts {
+    # The driver INFs the app ships, in its own folders or among its MSI's files: the services they install, the
+    # hardware IDs they match, and each file's SHA-256. Windows stages a driver package by copying the INF verbatim
+    # to %SystemRoot%\INF\oemN.inf, so a hash match says "this package is the app's own" - far stronger than the
+    # vendor name inside a .sys, which was all a driver in System32\drivers had to go on (Npcap, VirtualBox: left
+    # as "uncertain", lab 2026-10-12). Bounded: MaxFiles INFs, none over 4 MB.
+    param([string[]] $Roots, $Files, [int] $MaxFiles = 3000)
+    $facts = [pscustomobject]@{ Services = @{}; HardwareIds = @{}; Hashes = @{} }   # name -> the INF that says so
+    $paths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($p in @($Files)) { if ($p -and ([string]$p) -match '(?i)\.inf$' -and (Test-Path -LiteralPath $p -PathType Leaf)) { [void]$paths.Add([string]$p) } }
+    foreach ($r in @($Roots | Where-Object { $_ })) {
+        if (-not (Test-Path -LiteralPath $r -PathType Container)) { continue }
+        try {
+            foreach ($p in [System.IO.Directory]::EnumerateFiles($r, '*.inf', [System.IO.SearchOption]::AllDirectories)) {
+                [void]$paths.Add($p)
+                if ($paths.Count -ge $MaxFiles) { break }
+            }
+        } catch { Add-Unreadable 'driver packages' }
+    }
+    foreach ($p in $paths) {
+        try {
+            if ((New-Object System.IO.FileInfo($p)).Length -gt 4MB) { continue }
+            $hash = Get-FileSha256 $p
+            if (-not $facts.Hashes.ContainsKey($hash)) { $facts.Hashes[$hash] = $p }
+            $f = Read-InfFacts ([System.IO.File]::ReadAllText($p))
+            foreach ($s in $f.Services) { if (-not $facts.Services.ContainsKey($s)) { $facts.Services[$s] = $p } }
+            foreach ($h in $f.HardwareIds) { if (-not $facts.HardwareIds.ContainsKey($h)) { $facts.HardwareIds[$h] = $p } }
+        } catch { Add-Unreadable 'driver packages' }
+    }
+    return $facts
 }
 
 function Get-InfDeviceUsers {
@@ -1934,6 +2012,11 @@ function New-KillItWithFirePlan {
     & $Say '  scanning services, drivers, device filters, network components...'
     # ---------------------------------------------------------------- devices: which services drive present hardware
     $deviceBound = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    # Services that drive a device NOT created by software (any bus but ROOT): real hardware, never the app's to take.
+    $realDeviceBound = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    # ROOT-enumerated devices: created by software (an app's virtual adapter), never physical. Candidates only;
+    # one is the app's when the app's own service drives it (below).
+    $rootInstances = @()
     $enumRoot = Open-Key 'HKLM64' 'SYSTEM\CurrentControlSet\Enum' 'device instances'
     $enumInstances = @()
     foreach ($bus in (Get-SubKeyNamesSafe $enumRoot 'device instances')) {
@@ -1944,7 +2027,13 @@ function New-KillItWithFirePlan {
                 $ik = $null; try { $ik = $dk.OpenSubKey($inst, $false) } catch { Add-Unreadable 'device instances'; continue }
                 if ($null -eq $ik) { continue }
                 $svc = [string](Get-ValueSafe $ik 'Service')
-                if ($svc) { [void]$deviceBound.Add($svc) }
+                if ($svc) { [void]$deviceBound.Add($svc); if ($bus -ine 'ROOT') { [void]$realDeviceBound.Add($svc) } }
+                if ($bus -ieq 'ROOT' -and $svc) {
+                    $rootName = [string](Get-ValueSafe $ik 'FriendlyName'); if (-not $rootName) { $rootName = [string](Get-ValueSafe $ik 'DeviceDesc') }
+                    if ($rootName -match '^@.*;(.+)$') { $rootName = $matches[1] }
+                    $rootInstances += [pscustomobject]@{ InstanceId = "$bus\$dev\$inst"; Service = $svc; Name = $rootName; Driver = [string](Get-ValueSafe $ik 'Driver')
+                        ClassGuid = [string](Get-ValueSafe $ik 'ClassGUID'); Class = [string](Get-ValueSafe $ik 'Class'); HardwareIds = @(Get-ValueSafe $ik 'HardwareID' | Where-Object { $_ }) }
+                }
                 $upper = @(Get-ValueSafe $ik 'UpperFilters' | Where-Object { $_ }); $lower = @(Get-ValueSafe $ik 'LowerFilters' | Where-Object { $_ })
                 if ($upper.Count -or $lower.Count) {
                     $friendly = [string](Get-ValueSafe $ik 'FriendlyName'); if (-not $friendly) { $friendly = [string](Get-ValueSafe $ik 'DeviceDesc') }
@@ -1994,13 +2083,27 @@ function New-KillItWithFirePlan {
         return $false
     }
     $vendorNames = @(@($signerOrg, $publisher) | Where-Object { $_ -and -not (Test-IsMicrosoftName $_) })
+    # The driver INFs the app ships (its own folders, its MSI's files): which services and hardware IDs they install.
+    $appInf = Get-AppInfFacts -Roots $script:MatchRoots -Files $script:OurFiles
     $ourServices = @()
     foreach ($s in $services) {
-        $ev = @(); $weak = $false
+        $ev = @(); $weak = $false; $weakNote = $null
         if ($s.ImageRaw -and (Test-OurReference $s.ImageRaw)) { $ev += "runs $($s.ImageRaw)" }
         elseif ($s.Image -and (Test-OurReference $s.Image)) { $ev += "image $($s.Image) points at the app" }
         if ($s.ServiceDll -and (Test-OurReference $s.ServiceDll)) { $ev += "ServiceDll $($s.ServiceDll) points at the app" }
         if ($msiServiceNames -contains $s.Name) { $ev += "the app's MSI installs service '$($s.Name)'" }
+        # Only a real service definition (it has a Type): an INF also names services for options never installed, and
+        # Npcap's installer leaves an npcap_wifi key holding nothing but Start=4. Claimed, "sc delete" found no such
+        # service and stopped the run part way (lab 2026-10-12).
+        if (-not $ev.Count -and $s.Type -ne 0 -and $appInf.Services.ContainsKey($s.Name)) {
+            # A driver in System32\drivers that the app's OWN INF installs (AddService) is the app's: that is how
+            # the driver got there. Still "needs review" when it also drives real hardware (a device on any bus
+            # but ROOT), or its file lives under another installed product: then it is not the app's alone.
+            $file = if ($s.ServiceDll) { $s.ServiceDll } else { $s.Image }
+            $ev += "the app's own $($appInf.Services[$s.Name]) installs service '$($s.Name)'"
+            if ($realDeviceBound.Contains($s.Name)) { $weak = $true; $weakNote = 'needs review: the app''s INF installs it, but it also drives present hardware' }
+            elseif ($file -and (& $underOtherProduct $file)) { $weak = $true; $weakNote = 'needs review: the app''s INF installs it, but its file lives under another installed product' }
+        }
         if (-not $ev.Count -and $vendorNames.Count -and -not $samePublisherOthers.Count) {
             # Vendor-only ties are ALWAYS "needs review", never for a boot-start driver, and never for a
             # driver that serves present hardware: a target like "Intel Driver & Support Assistant" would
@@ -2019,7 +2122,7 @@ function New-KillItWithFirePlan {
                 }
             }
         }
-        if ($ev.Count) { $ourServices += [pscustomobject]@{ Svc = $s; Evidence = ($ev -join '; '); Weak = $weak } }
+        if ($ev.Count) { $ourServices += [pscustomobject]@{ Svc = $s; Evidence = ($ev -join '; '); Weak = $weak; WeakNote = $weakNote } }
     }
     $ourServiceNames = @($ourServices | ForEach-Object { $_.Svc.Name })
     $ourDriverNames = @($ourServices | Where-Object { $_.Svc.Type -band 0xB } | ForEach-Object { $_.Svc.Name })
@@ -2029,7 +2132,7 @@ function New-KillItWithFirePlan {
         $isDriver = [bool]($s.Type -band 0xB)
         $boot = ($isDriver -and $s.Start -le 1)
         if ($o.Weak) { [void]$reviewServices.Add($s.Name) }
-        $note = if ($o.Weak) { "needs review: tied only by the file's declared vendor$(if ($samePublisherOthers.Count) { ", and $publisher has other products installed" })" } else { $null }
+        $note = if ($o.Weak -and $o.WeakNote) { $o.WeakNote } elseif ($o.Weak) { "needs review: tied only by the file's declared vendor$(if ($samePublisherOthers.Count) { ", and $publisher has other products installed" })" } else { $null }
         $quarantineImage = ($isDriver -and $s.Image -and -not (Test-OurReference $s.Image))
         $op = [ordered]@{ kind = 'ServiceDelete'; name = $s.Name; isDriver = $isDriver; bootStart = $boot; image = $s.Image; quarantineImage = $quarantineImage }
         if ($isDriver) {
@@ -2046,6 +2149,30 @@ function New-KillItWithFirePlan {
             $company = Get-VendorOfFile $s.Image
             foreach ($v in $vendorNames) { if ($company -and (Test-SameVendor $company $v)) { $script:Warnings.Add("Driver $($s.Name) is from the same vendor but serves present hardware: not planned."); break } }
         }
+    }
+
+    # ---------------------------------------------------------------- the app's own software devices
+    # A ROOT-enumerated device (created by software, never physical: FortiClient's two virtual adapters,
+    # VirtualBox's host-only adapter) driven by one of the app's own services is the app's. It goes BEFORE its
+    # driver package: a package a device still uses is never deleted, and a device left behind came back at the
+    # next boot from the package that survived with it (FortiClient VPN 7.4, lab 2026-10-12). Real hardware is
+    # never a ROOT device, and a service still "needs review" plans no device. Restore re-creates the device.
+    $ourRootMatchIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($ri in $rootInstances) {
+        if ($ourServiceNames -notcontains $ri.Service -or $reviewServices.Contains($ri.Service)) { continue }
+        $mid = $null; $devInf = $null
+        if ($ri.Driver) {
+            $ck = Open-Key 'HKLM64' "SYSTEM\CurrentControlSet\Control\Class\$($ri.Driver)"
+            $mid = [string](Get-ValueSafe $ck 'MatchingDeviceId'); $devInf = [string](Get-ValueSafe $ck 'InfPath')
+            Close-Key $ck
+        }
+        if ($mid) { [void]$ourRootMatchIds.Add($mid) }
+        $cls = if ($ri.Class) { $ri.Class } else { ($ri.InstanceId -split '\\')[1] }
+        [void](Add-PlanItem -Category 'SoftwareDevice' -Level 3 -Target "software device $($ri.InstanceId) '$($ri.Name)'" `
+                -Action "pnputil /remove-device $($ri.InstanceId), before its driver package goes (restore re-creates it)" `
+                -Evidence "created by software (ROOT-enumerated, not hardware) and driven by our service '$($ri.Service)'" -Risk 'high' `
+                -Op ([ordered]@{ kind = 'SoftwareDeviceRemove'; instanceId = $ri.InstanceId; hardwareIds = @($ri.HardwareIds); classGuid = $ri.ClassGuid; className = $cls
+                    inf = $(if ($devInf -match '^(?i)oem\d+\.inf$') { $devInf } else { $null }) }))
     }
 
     # ---------------------------------------------------------------- the app's own programs still running
@@ -2150,6 +2277,9 @@ function New-KillItWithFirePlan {
                     if (-not $strings.ContainsKey($l.Groups[1].Value)) { $strings[$l.Groups[1].Value] = $l.Groups[2].Value.Trim() }
                 }
             }
+            # A verbatim copy of an INF the app ships: Windows staged this package from the app's own files.
+            $byHash = $null
+            if ($appInf.Hashes.Count) { try { $h = Get-FileSha256 $inf.FullName; if ($appInf.Hashes.ContainsKey($h)) { $byHash = $appInf.Hashes[$h] } } catch { } }
             $byCid = $null
             foreach ($cid in $ourNetComponents.Keys) { if ($text -match ('(?i)(?<![A-Za-z0-9_])' + [regex]::Escape($cid) + '(?![A-Za-z0-9_])')) { $byCid = $cid; break } }
             # EVERY service the package installs, not just the first of ours: one package can carry a device's
@@ -2172,22 +2302,24 @@ function New-KillItWithFirePlan {
                     }
                 }
             }
-            if ($byCid -or $bySvc) {
+            if ($byCid -or $bySvc -or $byHash) {
                 # Only fill in the component's INF when Windows didn't record one (see InfPath above).
                 if ($byCid -and -not $ourNetComponents[$byCid].op.inf) { $ourNetComponents[$byCid].op.inf = $inf.Name }
-                $key = if ($byCid) { $byCid } else { $bySvc }
-                $review = ($byCid -and $ourNetComponents[$byCid].review) -or ($bySvc -and $reviewServices.Contains($bySvc))
+                $key = if ($byCid) { $byCid } elseif ($bySvc) { $bySvc } else { $inf.Name }
+                # A hash match is the strongest tie there is; otherwise as strong as the component or service it installs.
+                $review = (-not $byHash) -and (($byCid -and $ourNetComponents[$byCid].review) -or ($bySvc -and $reviewServices.Contains($bySvc)))
                 # `pnputil /delete-driver /uninstall` takes the package off every device using it. A package
                 # that also installs someone else's service, or that a device other than our own network
                 # components is using, is reported and never removed: on a storage or display driver
                 # that is a machine that won't boot or shows nothing.
-                $users = @(Get-InfDeviceUsers $inf.Name | Where-Object { $ourNetComponents.Keys -notcontains $_ })
+                # The app's own software devices are not users: they are removed first (SoftwareDevice, above).
+                $users = @(Get-InfDeviceUsers $inf.Name | Where-Object { $ourNetComponents.Keys -notcontains $_ -and -not $ourRootMatchIds.Contains($_) })
                 $blocked = @()
                 if ($foreignSvc.Count) { $blocked += "it also installs service(s) $($foreignSvc -join ', ')" }
                 if ($users.Count) { $blocked += "device(s) use it: $(($users | Select-Object -First 3) -join ', ')" }
                 [void](Add-PlanItem -Category 'DriverPackage' -Level 3 -Target "driver package $($inf.Name)" `
                         -Action $(if ($blocked.Count) { "leave it: $($blocked -join '; ')" } else { "pnputil /delete-driver $($inf.Name) /uninstall (exported to the backup first)" }) `
-                        -Evidence $(if ($byCid) { "$($inf.Name) installs our network component $byCid" } else { "$($inf.Name) installs our service '$bySvc'" }) -Risk 'high' `
+                        -Evidence $(if ($byHash) { "$($inf.Name) is a copy of the app's own $byHash" } elseif ($byCid) { "$($inf.Name) installs our network component $byCid" } else { "$($inf.Name) installs our service '$bySvc'" }) -Risk 'high' `
                         -Review:($review -and -not $blocked.Count) -Note $(if ($blocked.Count) { 'not removed: ' + ($blocked -join '; ') } elseif ($review) { "needs review: '$key' is tied by vendor only" } else { $null }) `
                         -Op $(if ($blocked.Count) { $null } else { [ordered]@{ kind = 'DriverPackageDelete'; inf = $inf.Name } }))
             }
@@ -3307,6 +3439,60 @@ if (-not ('KillItWithFire.Native' -as [type])) {
 public static extern bool MoveFileEx(string existingFileName, string newFileName, int flags);
 // Remove an (empty) folder at the next boot. A real NULL destination: PowerShell turns $null into "".
 public static bool DeleteOnReboot(string path) { return MoveFileEx(path, null, 4); }
+// Put back a software (ROOT-enumerated) device the run removed: register a new root device of its class with its
+// hardware IDs, then install its driver from the backed-up INF (what devcon install does). Windows numbers it
+// afresh (ROOT\NET\0000 may come back as ROOT\NET\0001). 0 = done, else a Windows error code.
+[StructLayout(LayoutKind.Sequential)] public struct SP_DEVINFO_DATA { public int cbSize; public Guid ClassGuid; public int DevInst; public IntPtr Reserved; }
+[DllImport("setupapi.dll", SetLastError = true)] private static extern IntPtr SetupDiCreateDeviceInfoList(ref Guid classGuid, IntPtr hwndParent);
+[DllImport("setupapi.dll", SetLastError = true, CharSet = CharSet.Unicode)] private static extern bool SetupDiCreateDeviceInfoW(IntPtr set, string deviceName, ref Guid classGuid, string description, IntPtr hwndParent, int flags, ref SP_DEVINFO_DATA data);
+[DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiSetDeviceRegistryPropertyW(IntPtr set, ref SP_DEVINFO_DATA data, int property, byte[] buffer, int size);
+[DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiCallClassInstaller(int function, IntPtr set, ref SP_DEVINFO_DATA data);
+[DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiDestroyDeviceInfoList(IntPtr set);
+[DllImport("newdev.dll", SetLastError = true, CharSet = CharSet.Unicode)] private static extern bool UpdateDriverForPlugAndPlayDevicesW(IntPtr hwndParent, string hardwareId, string infPath, int flags, out bool reboot);
+// Put a file's security descriptor back exactly as recorded (SDDL), owner TrustedInstaller and DACL flags included:
+// .NET's file ACL API marks the DACL auto-inherited and cannot set a foreign owner, and icacls did not take one
+// either (lab 2026-10-12). Setting another account as owner needs the restore privilege, enabled here (an
+// administrator holds it, off by default). 0 = done, else a Windows error code.
+[DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)] private static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(string sddl, uint revision, out IntPtr sd, out uint size);
+[DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)] private static extern bool SetFileSecurityW(string path, uint information, IntPtr sd);
+[DllImport("kernel32.dll")] private static extern IntPtr LocalFree(IntPtr handle);
+[DllImport("kernel32.dll")] private static extern IntPtr GetCurrentProcess();
+[DllImport("kernel32.dll")] private static extern bool CloseHandle(IntPtr handle);
+[DllImport("advapi32.dll", SetLastError = true)] private static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+[DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)] private static extern bool LookupPrivilegeValueW(string system, string name, out long luid);
+[StructLayout(LayoutKind.Sequential, Pack = 4)] private struct TokenPrivilege1 { public int Count; public long Luid; public int Attributes; }
+[DllImport("advapi32.dll", SetLastError = true)] private static extern bool AdjustTokenPrivileges(IntPtr token, bool disableAll, ref TokenPrivilege1 state, int length, IntPtr previous, IntPtr returnLength);
+private static void EnablePrivilege(string name) {
+    IntPtr t;
+    if (!OpenProcessToken(GetCurrentProcess(), 0x28, out t)) { return; }   // TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY
+    try { long l; if (LookupPrivilegeValueW(null, name, out l)) { var p = new TokenPrivilege1 { Count = 1, Luid = l, Attributes = 2 }; AdjustTokenPrivileges(t, false, ref p, 0, IntPtr.Zero, IntPtr.Zero); } }
+    finally { CloseHandle(t); }
+}
+public static int SetFileSddl(string path, string sddl) {
+    EnablePrivilege("SeRestorePrivilege"); EnablePrivilege("SeTakeOwnershipPrivilege");
+    IntPtr sd; uint size;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, out sd, out size)) { return Marshal.GetLastWin32Error(); }
+    try { return SetFileSecurityW(path, 0x7, sd) ? 0 : Marshal.GetLastWin32Error(); }   // OWNER | GROUP | DACL
+    finally { LocalFree(sd); }
+}
+public static int CreateRootDevice(string className, string classGuid, string[] hardwareIds, string infPath, out bool reboot) {
+    reboot = false;
+    if (hardwareIds == null || hardwareIds.Length == 0) { return 87; }
+    Guid g = new Guid(classGuid);
+    IntPtr set = SetupDiCreateDeviceInfoList(ref g, IntPtr.Zero);
+    if (set == new IntPtr(-1)) { return Marshal.GetLastWin32Error(); }
+    try {
+        var d = new SP_DEVINFO_DATA(); d.cbSize = Marshal.SizeOf(typeof(SP_DEVINFO_DATA));
+        if (!SetupDiCreateDeviceInfoW(set, className, ref g, null, IntPtr.Zero, 1, ref d)) { return Marshal.GetLastWin32Error(); }   // DICD_GENERATE_ID
+        byte[] ids = System.Text.Encoding.Unicode.GetBytes(string.Join("\0", hardwareIds) + "\0\0");
+        if (!SetupDiSetDeviceRegistryPropertyW(set, ref d, 1, ids, ids.Length)) { return Marshal.GetLastWin32Error(); }           // SPDRP_HARDWAREID
+        if (!SetupDiCallClassInstaller(0x19, set, ref d)) { return Marshal.GetLastWin32Error(); }                                     // DIF_REGISTERDEVICE
+    } finally { SetupDiDestroyDeviceInfoList(set); }
+    bool rb;
+    if (!UpdateDriverForPlugAndPlayDevicesW(IntPtr.Zero, hardwareIds[0], infPath, 1, out rb)) { return Marshal.GetLastWin32Error(); }  // INSTALLFLAG_FORCE
+    reboot = rb;
+    return 0;
+}
 // Re-create a service through the API, not sc.exe: an image path with its own quotes ("C:\x y\a.exe" -svc)
 // reaches sc.exe mangled from Windows PowerShell 5.1 (lab 2026-09-26: error 1639).
 [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
@@ -3637,6 +3823,30 @@ public static long LastWriteFileTime(Microsoft.Win32.SafeHandles.SafeRegistryHan
 '@
 }
 
+function Grant-AdminAccessForMove {
+    # A driver file Windows' own driver installer laid down can be owned by TrustedInstaller with no write access for
+    # Administrators: then neither a move nor a boot-time move is allowed (VBoxNetAdp6.sys, lab 2026-10-12:
+    # "Access is denied", MoveFileEx error 5). Take ownership and grant Administrators full control. The original
+    # security descriptor goes beside the quarantined copy (Destination.kiwf-sddl) so a restore puts it back
+    # exactly, owner included (Restore-QuarantinedAcl).
+    param([string] $Path, [string] $Destination)
+    $sddl = (Get-Acl -LiteralPath $Path).Sddl
+    [System.IO.File]::WriteAllText("$Destination.kiwf-sddl", $sddl)
+    $o1 = Invoke-Native 'takeown.exe' @('/F', $Path, '/A')
+    $o2 = Invoke-Native 'icacls.exe' @($Path, '/grant', '*S-1-5-32-544:F')
+    if ($o1.Code -ne 0 -or $o2.Code -ne 0) { throw "could not take ownership of $Path ($($o1.Output.Trim()) $($o2.Output.Trim()))" }
+}
+
+function Restore-QuarantinedAcl {
+    # Put back the security descriptor Grant-AdminAccessForMove took over: the DACL first, then the owner (which may
+    # be TrustedInstaller: icacls /setowner enables the restore privilege that takes).
+    param([string] $QuarantinedPath, [string] $Path)
+    $side = "$QuarantinedPath.kiwf-sddl"
+    if (-not (Test-Path -LiteralPath $side) -or -not (Test-Path -LiteralPath $Path)) { return }
+    $code = [KillItWithFire.Native]::SetFileSddl($Path, [System.IO.File]::ReadAllText($side).Trim())
+    if ($code -ne 0) { try { Write-RunLog "  $Path is back, but its original permissions could not be set (Windows error $code)" } catch { } }
+}
+
 function Move-PathOrSchedule {
     # Move now if possible; a file in use is scheduled to move at the next boot (still into the
     # quarantine, so it stays restorable). Returns 'moved' or 'pending'.
@@ -3648,8 +3858,14 @@ function Move-PathOrSchedule {
         return 'moved'
     } catch {
         if (Test-Path -LiteralPath $Source -PathType Container) { throw }
+        $first = $_.Exception.Message
+        $ex = $_.Exception; while ($ex.InnerException) { $ex = $ex.InnerException }
+        if ($ex -is [System.UnauthorizedAccessException]) {
+            Grant-AdminAccessForMove $Source $Destination
+            try { [System.IO.File]::Move($Source, $Destination); return 'moved' } catch { $first = $_.Exception.Message }
+        }
         if ([KillItWithFire.Native]::MoveFileEx($Source, $Destination, 0x4)) { return 'pending' }
-        throw "could not move or schedule $Source ($($_.Exception.Message))"
+        throw "could not move or schedule $Source ($first)"
     }
 }
 
@@ -4070,6 +4286,26 @@ function Invoke-PrimitiveOp {
             if ($o.Code -eq 0) { $rec.result = 'done' }
             elseif ($o.Code -eq 0x0004A020 -or $o.Output -match '(?i)reboot') { $rec.result = 'pending' }
             else { throw "netcfg -u $($Op.componentId) failed ($($o.Code)): $($o.Output)" }
+        }
+        'SoftwareDeviceRemove' {
+            # Already gone (the app's own uninstaller removed its virtual adapter): skipped.
+            $ek = Open-Key 'HKLM64' "SYSTEM\CurrentControlSet\Enum\$($Op.instanceId)"
+            if ($null -eq $ek) { $rec.result = 'skipped'; break }
+            Close-Key $ek
+            if ($script:Run.Backup) {
+                # Restore re-creates the device from its hardware IDs and this package; the package's own step may
+                # delete it next, so it is exported here (that step then reuses the export).
+                if (-not $Op.inf) { throw "no driver package known for $($Op.instanceId): refusing to remove it without a way back" }
+                $exportDir = Join-Path $script:Run.Root "drivers\$($Op.inf)"
+                if (-not (Test-Path -LiteralPath $exportDir) -or -not @(Get-ChildItem -LiteralPath $exportDir -Recurse -Filter *.inf -ErrorAction SilentlyContinue).Count) {
+                    [void](New-Item -ItemType Directory -Force -Path $exportDir)
+                    $o = Invoke-Native 'pnputil.exe' @('/export-driver', [string]$Op.inf, $exportDir)
+                    if ($o.Code -ne 0) { throw "pnputil /export-driver $($Op.inf) failed ($($o.Code)): $($o.Output)" }
+                }
+                $rec.backup = $exportDir
+            }
+            $o = Invoke-Native 'pnputil.exe' @('/remove-device', [string]$Op.instanceId)
+            if ($o.Code -eq 0) { $rec.result = 'done' } elseif ($o.Code -eq 3010 -or $o.Output -match '(?i)reboot') { $rec.result = 'pending' } else { throw "pnputil /remove-device $($Op.instanceId) failed ($($o.Code)): $($o.Output)" }
         }
         'DriverPackageDelete' {
             if (-not (Test-Path -LiteralPath (Join-Path $env:SystemRoot "INF\$($Op.inf)"))) { $rec.result = 'skipped'; break }
@@ -4630,7 +4866,7 @@ function Invoke-KillItWithFireRestore {
                     foreach ($m in @(Get-Prop $r 'moves') | Where-Object { $_ } | Sort-Object { $_.src.Length }) {
                         if ($m.state -eq 'pending') {
                             if (Test-Path -LiteralPath $m.dst) { $m.state = 'moved' }
-                            else { Clear-PendingMove $m.src; continue }
+                            else { Clear-PendingMove $m.src; Restore-QuarantinedAcl $m.dst $m.src; continue }
                         }
                         if ($m.state -eq 'emptied-pending') {
                             # Before the reboot the folder is still there: just cancel its removal.
@@ -4652,13 +4888,13 @@ function Invoke-KillItWithFireRestore {
                         if (Test-Path -LiteralPath $m.src) { throw "something new already exists at $($m.src); not overwritten" }
                         $parent = Split-Path $m.src -Parent
                         if (-not (Test-Path -LiteralPath $parent)) { [void](New-Item -ItemType Directory -Path $parent -Force) }
-                        if (Test-Path -LiteralPath $m.dst -PathType Container) { [System.IO.Directory]::Move($m.dst, $m.src) } else { [System.IO.File]::Move($m.dst, $m.src) }
+                        if (Test-Path -LiteralPath $m.dst -PathType Container) { [System.IO.Directory]::Move($m.dst, $m.src) } else { [System.IO.File]::Move($m.dst, $m.src); Restore-QuarantinedAcl $m.dst $m.src }
                     }
                 }
                 'ServiceDelete' {
                     foreach ($m in @(Get-Prop $r 'moves') | Where-Object { $_ }) {
-                        if ((Test-Path -LiteralPath $m.dst) -and -not (Test-Path -LiteralPath $m.src)) { [System.IO.File]::Move($m.dst, $m.src) }
-                        elseif ($m.state -eq 'pending') { Clear-PendingMove $m.src }
+                        if ((Test-Path -LiteralPath $m.dst) -and -not (Test-Path -LiteralPath $m.src)) { [System.IO.File]::Move($m.dst, $m.src); Restore-QuarantinedAcl $m.dst $m.src }
+                        elseif ($m.state -eq 'pending') { Clear-PendingMove $m.src; Restore-QuarantinedAcl $m.dst $m.src }
                     }
                     # The run only moved the file (something else had already removed the service): the
                     # file is back, and whatever removed the service puts it back (netcfg -l, restored below).
@@ -4707,6 +4943,17 @@ function Invoke-KillItWithFireRestore {
                     $o = Invoke-Native 'netcfg.exe' @('-l', $inf[0].FullName, '-c', [string]$r.op.netClass, '-i', [string]$r.op.componentId)
                     if ($o.Code -ne 0 -and $o.Code -ne 0x0004A020) { throw "netcfg -l failed ($($o.Code)): $($o.Output)" }
                     if ($o.Code -eq 0x0004A020) { $reboot = $true }
+                }
+                'SoftwareDeviceRemove' {
+                    $inf = @(Get-ChildItem -LiteralPath $r.backup -Recurse -Filter *.inf -ErrorAction Stop | Select-Object -First 1)
+                    if (-not $inf.Count) { throw "no exported driver package in $($r.backup)" }
+                    $hw = [string[]]@($r.op.hardwareIds | Where-Object { $_ })
+                    if (-not $hw.Count) { throw "no hardware ID recorded for $($r.op.instanceId)" }
+                    $rb = $false
+                    $code = [KillItWithFire.Native]::CreateRootDevice([string]$r.op.className, [string]$r.op.classGuid, $hw, $inf[0].FullName, [ref]$rb)
+                    if ($code -ne 0) { throw "could not re-create software device $($r.op.instanceId) (Windows error $code)" }
+                    if ($rb) { $reboot = $true }
+                    Write-RunLog "  software device $($r.op.instanceId) re-created (Windows may number it differently)"
                 }
                 'DriverPackageDelete' {
                     $inf = @(Get-ChildItem -LiteralPath $r.backup -Recurse -Filter *.inf -ErrorAction Stop | Select-Object -First 1)
@@ -4829,12 +5076,16 @@ function Invoke-KillItWithFireResume {
             $ok = $false
             if ($bootedSince) { $lost += "network component $($r.op.componentId)" }
         }
+        if ($r.kind -eq 'SoftwareDeviceRemove' -and (Test-Path -LiteralPath "Registry::HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Enum\$($r.op.instanceId)")) {
+            $ok = $false
+            if ($bootedSince) { $lost += "software device $($r.op.instanceId)" }
+        }
         if ($r.kind -eq 'DriverPackageDelete' -and (Test-Path -LiteralPath (Join-Path $env:SystemRoot "INF\$($r.op.inf)"))) {
             $ok = $false
             if ($bootedSince) { $lost += "driver package $($r.op.inf)" }
         }
         # Anything else with no check of its own: only a boot since the run can have finished it.
-        if ($ok -and -not $bootedSince -and $r.kind -notin @('ServiceDelete', 'NetcfgUninstall', 'DriverPackageDelete') -and -not @(Get-Prop $r 'moves' | Where-Object { $_ }).Count) { $ok = $false }
+        if ($ok -and -not $bootedSince -and $r.kind -notin @('ServiceDelete', 'NetcfgUninstall', 'SoftwareDeviceRemove', 'DriverPackageDelete') -and -not @(Get-Prop $r 'moves' | Where-Object { $_ }).Count) { $ok = $false }
         if (-not $ok -and $lost.Count) {
             $leftInPlace++
             foreach ($x in $lost) { Write-RunLog "  left in place: $x (a boot has passed and the change is no longer queued; it did not happen)" }
@@ -4885,7 +5136,7 @@ $script:ActionDescriptions = @(
 $script:GroupDescriptions = @{
     Registration = 'The uninstall entry and the Windows Installer registration (product, features, upgrade code, component clients, patches, cached package). Removing them lets the app install again. Files are not touched.'
     LogonHooks   = 'Credential providers, network providers, LSA packages, Winlogon, AppInit and IFEO entries that load the app into sign-in or into every process. These go first, and the built-in password sign-in is turned back on if the app turned it off.'
-    Drivers      = 'Device filters, network components, driver packages and drivers. A filter is always removed before its driver, so the devices keep working after the reboot.'
+    Drivers      = 'Device filters, network components, the app''s own software devices (virtual adapters it created), driver packages and drivers. A filter is always removed before its driver, so the devices keep working after the reboot. Real hardware is never removed.'
     Services     = "Windows services the app installed (stopped, disabled and deleted), and the app's own programs still running from its folder (stopped: unsaved work in them is lost, and a restore does not restart them)."
     Startup      = 'Scheduled tasks, Run keys and Active Setup entries that start the app.'
     ComShell     = 'COM classes, type libraries, shell extensions, context-menu verbs and file associations that point at the app. A Windows file type the app took over is reported, never deleted.'
