@@ -18,8 +18,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Run tests
-        shell: ${{ matrix.shell }}
-        run: ./tests/Run-Tests.ps1
+        # A step's shell can't come from the matrix, so start the matrix shell explicitly.
+        shell: pwsh
+        run: |
+          & ${{ matrix.shell }} -NoProfile -ExecutionPolicy Bypass -File ./tests/Run-Tests.ps1
+          exit $LASTEXITCODE
 
   analyze:
     name: PSScriptAnalyzer
