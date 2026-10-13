@@ -4052,6 +4052,11 @@ function Invoke-PrimitiveOp {
             $rec.result = if ($pending) { 'pending' } else { 'done' }
         }
         'NetcfgUninstall' {
+            # Already gone (the app's own uninstaller unbinds its filter, and takes its driver package with it):
+            # skipped, like every other step whose target is gone. It used to go straight on to back up that
+            # package, fail on "not an installed OEM INF", and stop the whole run part way (FortiClient VPN 7.4,
+            # lab 2026-10-12). Still installed but with no package to back up still refuses, below.
+            if (-not (Test-NetComponentPresent ([string]$Op.componentId))) { $rec.result = 'skipped'; break }
             $exportDir = $null
             if ($Op.inf -and $script:Run.Backup) {
                 $exportDir = Join-Path $script:Run.Root "drivers\$($Op.inf)"
