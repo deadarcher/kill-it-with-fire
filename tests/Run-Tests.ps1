@@ -754,7 +754,8 @@ Initialize-RegistryBase
 if ([Environment]::Is64BitOperatingSystem) {
     Assert-Equal $true ((Get-KeyNativePath 'HKLM32' 'SOFTWARE\Classes\CLSID') -match '(?i)WOW6432Node') 'machine: the 32-bit CLSID tree is redirected'
     Assert-Equal (Get-KeyNativePath 'HKLM64' 'SOFTWARE\Classes\.txt') (Get-KeyNativePath 'HKLM32' 'SOFTWARE\Classes\.txt') 'machine: file extensions are shared between the views'
-    Assert-Equal 'HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall' (Format-RegPath 'HKLM32' 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall') 'machine: the 32-bit uninstall key is redirected'
+    # The node's spelling is the machine's own (WOW6432Node here, Wow6432Node on a GitHub runner); the registry ignores case.
+    Assert-Equal $true ((Format-RegPath 'HKLM32' 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall') -eq 'HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall') 'machine: the 32-bit uninstall key is redirected'
     Assert-Equal $null (Get-KeyNativePath 'HKLM64' 'SOFTWARE\KillItWithFire-no-such-key-7f3a') 'machine: a missing key has no native path'
 }
 
