@@ -1,29 +1,56 @@
 # Kill It With Fire
 
-<!-- BRIAN: the opening warning goes here, in your words. The beats (2026-10-03): it removes ANY app, live
-     or broken. The proper way is the default: the app's own uninstaller first, then whatever it left
-     behind. KILL IT skips the uninstaller and scrubs the app out. Either way it scans first, backs
-     everything up, and Restore puts it back; it never touches Microsoft software, security agents or
-     Windows itself. -->
+> [!WARNING]
+> **This removes software. Any software, live or broken.** That's the whole point, and it's also why you
+> should read the next few lines before you run it.
 
-Removes a Windows app completely, the proper way or the hard way:
+Every desktop engineer has a list of apps that won't die. The VPN client whose network driver outlives the
+software itself. The SSO agent that ships a crappy credential provider you can finally get rid of. I spent
+years cleaning these up by hand across a fleet of ~30,000 endpoints, with a bit of help from NirSoft's
+RegScanner. Kill It With Fire is everything I learned doing that, in one tool.
 
-- **The proper way** (the default): the app's own uninstaller runs first, silently, and then whatever it
-  left behind is cleaned up. For an MSI that is `msiexec /x`. For an EXE it is the app's registered quiet
-  uninstall command, or the silent switch of the engine that built its uninstaller (NSIS, Inno Setup,
-  WiX Burn, InstallShield, InstallAware), recognised from markers inside the uninstaller itself. An
-  uninstaller with no known silent switch is skipped rather than left waiting for a click, and one that
-  stops on a prompt nobody can see anyway (a "quiet" command that still asks Yes/No) is stopped after a
-  minute of waiting on it, with the prompt's text in the log. The cleanup then does the rest.
-- **KILL IT** (`-KillIt`, or KILL IT WITH FIRE in the window): skip the uninstaller and scrub the app out.
-  For an uninstaller that is broken, hangs, or wants a click nobody is there to give.
+It works one of two ways:
 
-What gets cleaned up: registration, services, drivers, device filters, network components, driver
-packages, scheduled tasks, startup entries, COM, shell extensions, file associations, logon hooks,
-firewall rules, shortcuts, folders and per-user state. Every item comes with the evidence that ties it
-to the app, everything it changes is backed up first, and a whole run can be restored. (A restore puts
-back what Kill It With Fire removed. After the proper way, the app's own uninstaller has already done
-most of the work, so reinstall the app instead.)
+- **The proper way** (the default): the app's own uninstaller runs first, silently, and then Kill It With
+  Fire cleans up whatever the uninstaller left behind.
+- **KILL IT WITH FIRE**: skip the uninstaller and scrub the app out. For when the uninstaller *is* the
+  problem.
+
+Either way:
+
+- **It scans first, and a scan changes nothing.** You get every item it wants to remove and *why* it thinks
+  that item belongs to the app. When the evidence is weak, it marks the item as uncertain and leaves it
+  alone unless you opt in.
+- **It backs everything up before it touches it,** and Restore puts the run back. (After the proper way,
+  the app's own uninstaller already did most of the work, and Restore only puts back what Kill It With
+  Fire removed. Reinstall the app instead.)
+- **It refuses Microsoft software, security agents and Windows itself,** and tells you why. If you need
+  your EDR gone, that's a conversation with your EDR vendor, not with a script.
+
+It runs as admin because it has to, which means it can do real damage if you don't know what you're doing.
+So: scan first, read the plan, try it on a VM before your fleet, and leave the backup on. I test every
+change against a lab of VMs (Imprivata, FortiClient VPN, VirtualBox, Npcap and a couple dozen more as of
+this writing) and it still isn't perfect.
+
+No warranty (MIT). If it breaks something, the backup is there, and I genuinely want to hear about it -
+open an issue.
+
+## How it works
+
+**The proper way** runs the app's own uninstaller silently. For an MSI that is `msiexec /x`. For an EXE
+it is the app's registered quiet uninstall command, or the silent switch of the engine that built its
+uninstaller (NSIS, Inno Setup, WiX Burn, InstallShield, InstallAware), recognised from markers inside the
+uninstaller itself. An uninstaller with no known silent switch is skipped rather than left waiting for a
+click, and one that stops on a prompt nobody can see (a "quiet" command that still asks Yes/No) is
+stopped after a minute, with the prompt's text in the log. The cleanup then does the rest.
+
+**KILL IT** (`-KillIt`, or KILL IT WITH FIRE in the window) skips the uninstaller and goes straight to the
+cleanup.
+
+The cleanup covers registration, services, drivers, device filters, network components, driver packages,
+software-created devices, scheduled tasks, startup entries, COM, shell extensions, file associations,
+logon hooks, firewall rules, shortcuts, folders and per-user state. Real hardware and drivers shared with
+other products are left alone.
 
 ## Levels
 
