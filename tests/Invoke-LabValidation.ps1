@@ -253,11 +253,14 @@ function Get-MsiProductState {
 }
 
 function Get-Uninstall {
-    param([string] $DisplayNameLike)
+    # -Msi: only a Windows Installer entry (a GitHub runner already has 7-Zip from its EXE installer).
+    param([string] $DisplayNameLike, [switch] $Msi)
     foreach ($root in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall')) {
         foreach ($k in @(Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue)) {
             $p = Get-ItemProperty -LiteralPath $k.PSPath -ErrorAction SilentlyContinue
-            if ($p -and ($p.PSObject.Properties.Name -contains 'DisplayName') -and $p.DisplayName -like $DisplayNameLike) { return $p }
+            if (-not $p -or -not ($p.PSObject.Properties.Name -contains 'DisplayName') -or $p.DisplayName -notlike $DisplayNameLike) { continue }
+            if ($Msi -and -not (($p.PSObject.Properties.Name -contains 'WindowsInstaller') -and $p.WindowsInstaller -eq 1)) { continue }
+            return $p
         }
     }
     return $null
@@ -473,13 +476,14 @@ switch ($Scenario) {
     'plan' {
         # The window's path: scan to a file, then -Plan <file> with categories left out.
         # Any 7-Zip MSI (a healthy one: this scenario checks the partial run and its restore, not breakage).
-        $z = Get-Uninstall '7-Zip*'
-        if (-not $z -or -not ($z.PSObject.Properties.Name -contains 'WindowsInstaller') -or $z.WindowsInstaller -ne 1) {
+        $z = Get-Uninstall '7-Zip*' -Msi
+        if (-not $z) {
             $zmsi = @(Get-ChildItem -LiteralPath $Media -Filter '7z*.msi' -ErrorAction SilentlyContinue | Select-Object -First 1)
             if (-not $zmsi.Count) { Check 'precondition: a 7-Zip MSI is installed (or 7z*.msi is in the media folder)' $false; Finish }
             [void](Invoke-Msiexec "/i `"$($zmsi[0].FullName)`" /qn /norestart")
-            $z = Get-Uninstall '7-Zip*'
+            $z = Get-Uninstall '7-Zip*' -Msi
         }
+        if (-not $z) { Check 'precondition: the 7-Zip MSI installed' $false; Finish }
         $pc = $z.PSChildName
         if ((Get-MsiProductState $pc) -ne 5) { Check "precondition: 7-Zip MSI $pc installed" $false; Finish }
         $scan = Join-Path $StateDir 'plan-scan'
@@ -604,6 +608,14 @@ switch ($Scenario) {
             Set-ItemProperty -Path 'HKLM:\SOFTWARE\KillItWithFire Lab\App' -Name InstallPath -Value $folder
             New-Item -Path 'HKLM:\SOFTWARE\KillItWithFire Unrelated' -Force | Out-Null
             Set-ItemProperty -Path 'HKLM:\SOFTWARE\KillItWithFire Unrelated' -Name Setting -Value 'blue'
+            # Another product's sloppy uninstall entry that names Program Files itself as its folder. It made
+            # every app's folder "inside another product's" and the plan kept nearly everything (GitHub runner,
+            # 2026-10-13). Program Files is nobody's folder.
+            $sloppy = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\KillItWithFireLabSloppyEntry'
+            New-Item -Path $sloppy -Force | Out-Null
+            Set-ItemProperty -Path $sloppy -Name DisplayName -Value 'Sloppy Entry Lab Product'
+            Set-ItemProperty -Path $sloppy -Name InstallLocation -Value "$env:ProgramFiles\"
+            Set-ItemProperty -Path $sloppy -Name UninstallString -Value "`"$env:ProgramFiles\sloppy-uninstall.exe`""
 
             $scan = Join-Path $StateDir 'hooks-scan'
             $r = Invoke-Engine @('-Name', $name, '-Level', '0', '-OutDir', $scan, '-Quiet')
@@ -670,7 +682,7 @@ switch ($Scenario) {
             Remove-Item -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\killitwithfirelabtarget.exe' -Recurse -Force -ErrorAction SilentlyContinue
             Remove-Item -Path 'HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{7E1F2A3B-LEFT-OVER-LAB0-000000000001}' -Recurse -Force -ErrorAction SilentlyContinue
             Remove-Item -Path 'HKLM:\SOFTWARE\Classes\Directory\shell\KillItWithFireLabVerb', 'HKLM:\SOFTWARE\Classes\.killitwithfirelab', 'HKLM:\SOFTWARE\Classes\KillItWithFireLab.File' -Recurse -Force -ErrorAction SilentlyContinue
-            Remove-Item -Path 'HKLM:\SOFTWARE\KillItWithFire Lab', 'HKLM:\SOFTWARE\KillItWithFire Unrelated' -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -Path 'HKLM:\SOFTWARE\KillItWithFire Lab', 'HKLM:\SOFTWARE\KillItWithFire Unrelated', 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\KillItWithFireLabSloppyEntry' -Recurse -Force -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath (Join-Path $env:PUBLIC 'Desktop\KillItWithFire Hooks Test.lnk') -Force -ErrorAction SilentlyContinue
             Unregister-ScheduledTask -TaskName 'KillItWithFireLabHooksTask' -Confirm:$false -ErrorAction SilentlyContinue
             Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -Name 'KillItWithFireLabHooks' -ErrorAction SilentlyContinue
@@ -740,7 +752,7 @@ switch ($Scenario) {
             $png = Join-Path $StateDir 'policy-window.png'
             $r = Invoke-Engine @('-GuiSelfTest', $png, '-Plan', (Join-Path $StateDir 'policy-scan\plan.json'))
             $json = $r.Output.Substring([Math]::Max(0, $r.Output.IndexOf('{'))) | ConvertFrom-Json
-            Check 'the window reads the REAL policy key: Full scrub greyed out' ((@($json.levelsEnabled) -join ',') -eq 'True,True,True,False')
+            Check 'the window reads the REAL policy key: Full scrub and KILL IT WITH FIRE greyed out' ((@($json.actionsEnabled) -join ',') -eq 'True,True,False,False') (@($json.actionsEnabled) -join ',')
             Check 'the window: backup and log locked on' ($json.backupChecked -and -not $json.backupEnabled -and $json.logChecked -and -not $json.logEnabled)
             Check 'the window: user data locked off' (-not $json.userDataEnabled)
             $r = Invoke-Engine @('-Name', $name, '-Level', '2', '-Force', '-Quiet')
