@@ -197,7 +197,9 @@ Never touched:
 
 - Microsoft software (by publisher, or by the signer of the app's own executables).
 - Security products. Use the vendor's removal tool; the report names it.
-- The RFF agent.
+- The RFF agent, but only from a run the agent itself started (removing it would stop that run part way,
+  and the machine would drop out of reach). Run locally or through another tool, it removes like any other
+  app. When another app is the target, the agent's folder is never part of its cleanup.
 - Windows folders, the Public profile, OneDrive, users' Desktop/Documents/Pictures/Music/Videos/
   Downloads, and `AppData\*\Microsoft`.
 - Signed-out users' registry hives: never loaded in this version. The report lists those profiles.

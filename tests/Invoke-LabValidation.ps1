@@ -18,7 +18,7 @@
       restorestop  a restore that can't undo one change stops there; a rerun finishes once the cause is gone
       plan       the window's path: -Plan <file> -Exclude ...; plan guards (other computer, stale plan)
       policy     HKLM\SOFTWARE\Policies\KillItWithFire locks enforced by the engine (and shown by the window)
-      refusal    the RFF agent, a Microsoft MSI by ProductCode, a security vendor, a Windows keyword
+      refusal    the RFF agent scans like any app; a Microsoft MSI by ProductCode, a security vendor, a Windows keyword
       bitness    a 32-bit PowerShell host relaunches 64-bit and finds the same plan
       pending    a locked file: exit 3010, then restore BEFORE the reboot (CI-safe)
       resume     a locked file: exit 3010; phase 'after' (after a reboot): -Resume, then restore
@@ -771,9 +771,14 @@ switch ($Scenario) {
     'refusal' {
         $agent = Get-Uninstall 'RFF Agent'
         if ($agent) {
-            $r = Invoke-Engine @('-Name', 'RFF Agent', '-Level', '3', '-Force', '-Quiet')
-            Check 'the RFF agent is refused (exit 2)' ($r.Code -eq 2 -and $r.Output -match 'REFUSED') "exit $($r.Code)"
-            Check 'the agent service is untouched' ([bool](Get-Service RFFAgent -ErrorAction SilentlyContinue))
+            # Not refused any more (only a run the agent itself started is). A scan only: this scenario keeps
+            # the machine's agent; removing it is proved by hand on a checkpointed VM.
+            $r = Invoke-Engine @('-Name', 'RFF Agent', '-Level', '0', '-OutDir', (Join-Path $StateDir 'agent-scan'), '-Quiet')
+            $ap = Get-Plan (Join-Path $StateDir 'agent-scan')
+            # Its folder stays (the MSI keeps appsettings.json as a permanent component); its services are planned.
+            $svcs = @($ap.items | Where-Object { $_.category -eq 'Service' } | ForEach-Object { $_.op.name })
+            Check 'the RFF agent scans like any other app: both services planned' ($r.Code -eq 0 -and -not $ap.refused -and $svcs -contains 'RFFAgent' -and $svcs -contains 'RFFUpdater') "exit $($r.Code); services: $($svcs -join ', ')"
+            Check 'the agent service is untouched by the scan' ([bool](Get-Service RFFAgent -ErrorAction SilentlyContinue))
         } else { Write-Host 'skip: no RFF agent on this machine' }
         # A Microsoft MSI by ProductCode (the runtimes hide as SystemComponent entries).
         $ms = $null
